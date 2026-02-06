@@ -123,6 +123,10 @@ extern int Atari800_turbo_speed;
 /* Set to TRUE to start in the monitor. It's up to each port's
 	main.c to implement this (initially only SDL supports it). */
 extern int Atari800_start_in_monitor;
+/* Set to TRUE to refresh video while monitor is active. */
+extern int Atari800_live_monitor;
+/* Set to TRUE to refresh audio while monitor is active. */
+extern int Atari800_live_monitor_audio;
 
 /* Initializes Atari800 emulation core. */
 int Atari800_Initialise(int *argc, char *argv[]);
@@ -135,6 +139,18 @@ void Atari800_Coldstart(void);
 
 /* Presses the Reset key in the emulated Atari. */
 void Atari800_Warmstart(void);
+void Atari800_RequestMonitor(void);
+void Atari800_RequestMonitorHeadless(void);
+void Atari800_SetBuiltinMonitor(int enabled);
+int Atari800_GetBuiltinMonitor(void);
+
+/* Emulation time helpers (seconds based on emulated frames). */
+double Atari800_GetEmulationSeconds(void);
+double Atari800_GetEmulationSecondsSinceReset(void);
+
+/* Process restart helpers (POSIX builds). */
+int Atari800_CanRestartProcess(void);
+int Atari800_RestartProcess(void);
 
 /* Reinitializes after Atari800_machine_type or ram_size change.
    You should call Atari800_Coldstart() after it. */

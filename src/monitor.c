@@ -28,6 +28,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <errno.h>
+#ifdef HAVE_SYS_SOCKET_H
+#include <sys/socket.h>
+#endif
+#ifdef HAVE_UNISTD_H
+#include <poll.h>
+#endif
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -49,11 +57,20 @@
 #include "pia.h"
 #include "pokey.h"
 #include "util.h"
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+#include "socketserver.h"
+#define MONITOR_NOTIFY_STATE_CHANGED() SocketServer_NotifyStateChanged()
+#else
+#define MONITOR_NOTIFY_STATE_CHANGED() do { } while (0)
+#endif
 #ifdef STEREO_SOUND
 #include "pokeysnd.h"
 #endif
 #include "platform.h"
 #include "statesav.h"
+#ifdef SOUND
+#include "sound.h"
+#endif
 
 #ifdef MONITOR_READLINE
 #include <readline/readline.h>
@@ -61,38 +78,507 @@
 #endif
 
 #ifdef __PLUS
-
-#include <stdarg.h>
 #include "misc_win.h"
+#endif
 
-FILE *mon_output, *mon_input;
+#define MONITOR_POLL_MS 1
 
-void monitor_printf(const char *format, ...)
+static FILE *mon_output = NULL;
+static FILE *mon_input = NULL;
+static int monitor_external_io = 0;
+static int monitor_input_empty = 0;
+static int monitor_input_eof = 0;
+static int monitor_output_is_socket = 0;
+static int monitor_output_fd = -1;
+static int monitor_queued_byte_valid = 0;
+static unsigned char monitor_queued_byte = 0;
+static int monitor_output_last_cr = 0;
+static int monitor_pending_action = MONITOR_ACTION_NONE;
+static int monitor_active = 0;
+static int monitor_pause_live_refresh = 0;
+static int monitor_headless_enabled = 0;
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+static int monitor_headless_pipe_w = -1;
+static FILE *monitor_headless_in = NULL;
+static FILE *monitor_headless_out = NULL;
+#endif
+
+void MONITOR_SetIO(FILE *input, FILE *output)
+{
+	mon_input = input;
+	mon_output = output;
+	monitor_external_io = 1;
+}
+
+void MONITOR_ResetIO(void)
+{
+	mon_input = NULL;
+	mon_output = NULL;
+	monitor_external_io = 0;
+	monitor_output_is_socket = 0;
+	monitor_output_fd = -1;
+	monitor_output_last_cr = 0;
+}
+
+int MONITOR_IsActive(void)
+{
+	return monitor_active;
+}
+
+void MONITOR_SetOutputSocket(int fd)
+{
+	monitor_output_fd = fd;
+	monitor_output_is_socket = (fd >= 0);
+	monitor_output_last_cr = 0;
+}
+
+int MONITOR_EnableHeadlessIO(void)
+{
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	int fds[2];
+
+	if (monitor_headless_enabled)
+		return 1;
+	if (pipe(fds) < 0)
+		return 0;
+	monitor_headless_in = fdopen(fds[0], "r");
+	if (monitor_headless_in == NULL) {
+		close(fds[0]);
+		close(fds[1]);
+		return 0;
+	}
+	monitor_headless_out = fopen("/dev/null", "w");
+	if (monitor_headless_out == NULL) {
+		fclose(monitor_headless_in);
+		monitor_headless_in = NULL;
+		close(fds[1]);
+		return 0;
+	}
+	monitor_headless_pipe_w = fds[1];
+	MONITOR_SetIO(monitor_headless_in, monitor_headless_out);
+	MONITOR_SetOutputSocket(-1);
+	monitor_headless_enabled = 1;
+	return 1;
+#else
+	return 0;
+#endif
+}
+
+void MONITOR_DisableHeadlessIO(void)
+{
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (!monitor_headless_enabled)
+		return;
+	MONITOR_ResetIO();
+	if (monitor_headless_in != NULL) {
+		fclose(monitor_headless_in);
+		monitor_headless_in = NULL;
+	}
+	if (monitor_headless_out != NULL) {
+		fclose(monitor_headless_out);
+		monitor_headless_out = NULL;
+	}
+	if (monitor_headless_pipe_w >= 0) {
+		close(monitor_headless_pipe_w);
+		monitor_headless_pipe_w = -1;
+	}
+	monitor_headless_enabled = 0;
+#endif
+}
+
+void MONITOR_QueueInputByte(int ch)
+{
+	monitor_queued_byte = (unsigned char)ch;
+	monitor_queued_byte_valid = 1;
+}
+
+static FILE *monitor_out(void)
+{
+	return mon_output != NULL ? mon_output : stdout;
+}
+
+static FILE *monitor_in(void)
+{
+	return mon_input != NULL ? mon_input : stdin;
+}
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+static int monitor_send_all(const char *buf, size_t len)
+{
+	size_t off = 0;
+	while (off < len) {
+		ssize_t n = send(monitor_output_fd, buf + off, len - off, MSG_NOSIGNAL);
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			if (errno == EPIPE || errno == ECONNRESET) {
+				monitor_input_empty = 1;
+				monitor_input_eof = 1;
+			}
+			return -1;
+		}
+		if (n == 0)
+			break;
+		off += (size_t)n;
+	}
+	if (off < len) {
+		monitor_input_empty = 1;
+		monitor_input_eof = 1;
+		return -1;
+	}
+	return 0;
+}
+
+static int monitor_write_data(const char *buf, size_t len)
+{
+	if (len == 0)
+		return 0;
+
+	if (monitor_external_io && monitor_output_is_socket && monitor_output_fd >= 0) {
+		size_t off = 0;
+		while (off < len) {
+			const char *nl = memchr(buf + off, '\n', len - off);
+			size_t seglen;
+			if (nl == NULL) {
+				seglen = len - off;
+				if (monitor_send_all(buf + off, seglen) < 0)
+					return -1;
+				if (seglen > 0)
+					monitor_output_last_cr = (buf[off + seglen - 1] == '\r');
+				off += seglen;
+				continue;
+			}
+			seglen = (size_t)(nl - (buf + off));
+			if (seglen > 0) {
+				if (monitor_send_all(buf + off, seglen) < 0)
+					return -1;
+				monitor_output_last_cr = (buf[off + seglen - 1] == '\r');
+			}
+			if (monitor_output_last_cr) {
+				if (monitor_send_all("\n", 1) < 0)
+					return -1;
+				monitor_output_last_cr = 0;
+			}
+			else {
+				if (monitor_send_all("\r\n", 2) < 0)
+					return -1;
+			}
+			off += seglen + 1;
+		}
+		return 0;
+	}
+
+	return (fwrite(buf, 1, len, monitor_out()) == len) ? 0 : -1;
+}
+
+static int monitor_putchar(int c)
+{
+	char ch = (char)c;
+	monitor_write_data(&ch, 1);
+	return (unsigned char)c;
+}
+
+static int monitor_fprintf(FILE *fp, const char *format, ...)
 {
 	va_list args;
+	va_list args_copy;
+	char stackbuf[256];
+	char *buf = stackbuf;
+	int needed;
+
+	if (!monitor_external_io || !monitor_output_is_socket || fp != monitor_out()) {
+		va_start(args, format);
+		needed = vfprintf(fp, format, args);
+		va_end(args);
+		return needed;
+	}
+
 	va_start(args, format);
-	vfprintf(mon_output, format, args);
+	va_copy(args_copy, args);
+	needed = vsnprintf(stackbuf, sizeof(stackbuf), format, args);
 	va_end(args);
+	if (needed < 0) {
+		va_end(args_copy);
+		return needed;
+	}
+	if ((size_t)needed >= sizeof(stackbuf)) {
+		buf = (char *)malloc((size_t)needed + 1);
+		if (buf == NULL) {
+			va_end(args_copy);
+			return -1;
+		}
+		vsnprintf(buf, (size_t)needed + 1, format, args_copy);
+	}
+	else {
+		memcpy(buf, stackbuf, (size_t)needed + 1);
+	}
+	monitor_write_data(buf, (size_t)needed);
+	if (buf != stackbuf)
+		free(buf);
+	va_end(args_copy);
+	return needed;
+}
+
+static int monitor_fputc(int c, FILE *fp)
+{
+	if (!monitor_external_io || !monitor_output_is_socket || fp != monitor_out())
+		return fputc(c, fp);
+	return monitor_putchar(c);
+}
+
+static void monitor_sync_os_shadows(void)
+{
+	ANTIC_PutByte(ANTIC_OFFSET_DMACTL, MEMORY_dGetByte(0x022f)); /* SDMCTL */
+	ANTIC_PutByte(ANTIC_OFFSET_DLISTL, MEMORY_dGetByte(0x0230)); /* SDLSTL */
+	ANTIC_PutByte(ANTIC_OFFSET_DLISTH, MEMORY_dGetByte(0x0231)); /* SDLSTH */
+	ANTIC_PutByte(ANTIC_OFFSET_CHACTL, MEMORY_dGetByte(0x02f3)); /* CHACT */
+	ANTIC_PutByte(ANTIC_OFFSET_CHBASE, MEMORY_dGetByte(0x02f4)); /* CHBAS */
+
+	GTIA_PutByte(GTIA_OFFSET_COLPM0, MEMORY_dGetByte(0x02c0)); /* PCOLR0 */
+	GTIA_PutByte(GTIA_OFFSET_COLPM1, MEMORY_dGetByte(0x02c1)); /* PCOLR1 */
+	GTIA_PutByte(GTIA_OFFSET_COLPM2, MEMORY_dGetByte(0x02c2)); /* PCOLR2 */
+	GTIA_PutByte(GTIA_OFFSET_COLPM3, MEMORY_dGetByte(0x02c3)); /* PCOLR3 */
+	GTIA_PutByte(GTIA_OFFSET_COLPF0, MEMORY_dGetByte(0x02c4)); /* COLOR0 */
+	GTIA_PutByte(GTIA_OFFSET_COLPF1, MEMORY_dGetByte(0x02c5)); /* COLOR1 */
+	GTIA_PutByte(GTIA_OFFSET_COLPF2, MEMORY_dGetByte(0x02c6)); /* COLOR2 */
+	GTIA_PutByte(GTIA_OFFSET_COLPF3, MEMORY_dGetByte(0x02c7)); /* COLOR3 */
+	GTIA_PutByte(GTIA_OFFSET_COLBK, MEMORY_dGetByte(0x02c8));  /* COLOR4 */
+	GTIA_PutByte(GTIA_OFFSET_PRIOR, MEMORY_dGetByte(0x026f));  /* GPRIOR */
+
+	POKEY_PutByte(POKEY_OFFSET_IRQEN, MEMORY_dGetByte(0x0010)); /* POKMSK */
+	POKEY_PutByte(POKEY_OFFSET_SKCTL, MEMORY_dGetByte(0x0232)); /* SSKCTL */
+}
+
+static void monitor_force_refresh(int do_video, int do_audio)
+{
+	int freeze_saved = CPU_freeze;
+
+	if (do_video)
+		monitor_sync_os_shadows();
+
+	CPU_freeze = 1;
+	if (do_video)
+		ANTIC_Frame(TRUE);
+	else
+		ANTIC_Frame(FALSE);
+	CPU_freeze = freeze_saved;
+
+#ifdef SOUND
+	if (do_audio) {
+		POKEY_Frame();
+		Sound_Update();
+	}
+#endif
+
+	if (do_video)
+		PLATFORM_DisplayScreen();
+}
+
+static void monitor_refresh_no_shadow(int do_video, int do_audio)
+{
+	int freeze_saved = CPU_freeze;
+
+	if (!do_video && !do_audio)
+		return;
+
+	CPU_freeze = 1;
+	if (do_video)
+		ANTIC_Frame(TRUE);
+	else
+		ANTIC_Frame(FALSE);
+	CPU_freeze = freeze_saved;
+
+#ifdef SOUND
+	if (do_audio) {
+		POKEY_Frame();
+		Sound_Update();
+	}
+#endif
+
+	if (do_video)
+		PLATFORM_DisplayScreen();
+}
+
+static void monitor_run_frame(int do_video, int do_audio)
+{
+	int freeze_saved = CPU_freeze;
+
+	if (!do_video && !do_audio)
+		return;
+
+	CPU_freeze = 0;
+	ANTIC_Frame(do_video ? TRUE : FALSE);
+	CPU_freeze = freeze_saved;
+
+#ifdef SOUND
+	if (do_audio) {
+		POKEY_Frame();
+		Sound_Update();
+	}
+#endif
+
+	if (do_video)
+		PLATFORM_DisplayScreen();
+}
+
+static void monitor_live_refresh(void)
+{
+	int do_video = Atari800_live_monitor;
+	int do_audio = Atari800_live_monitor_audio;
+	static double last_refresh_time = 0.0;
+	double now;
+	double frame_time;
+
+	if (!do_video && !do_audio) {
+		last_refresh_time = 0.0;
+		return;
+	}
+
+	now = Util_time();
+	frame_time = 1.0 / (Atari800_tv_mode == Atari800_TV_PAL ? Atari800_FPS_PAL : Atari800_FPS_NTSC);
+	if (last_refresh_time > 0.0 && (now - last_refresh_time) < frame_time)
+		return;
+	if (last_refresh_time <= 0.0 || (now - last_refresh_time) > 5.0 * frame_time)
+		last_refresh_time = now;
+	else
+		last_refresh_time += frame_time;
+
+	monitor_refresh_no_shadow(do_video, do_audio);
+}
+
+static void monitor_drain_pending_input(void)
+{
+	struct pollfd pfd;
+	unsigned char ch;
+	int fd;
+
+	if (!monitor_external_io || !monitor_output_is_socket)
+		return;
+
+	fd = fileno(monitor_in());
+	for (;;) {
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		if (poll(&pfd, 1, 0) <= 0)
+			break;
+		if (!(pfd.revents & POLLIN))
+			break;
+		if (read(fd, &ch, 1) != 1)
+			break;
+		if (ch != '\r' && ch != '\n') {
+			MONITOR_QueueInputByte(ch);
+			break;
+		}
+	}
+}
+
+static void monitor_puts_crlf(FILE *out, const char *s)
+{
+	const char *seg = s;
+	(void)out;
+	for (; *s != '\0'; s++) {
+		if (*s == '\n') {
+			if (s > seg)
+				monitor_write_data(seg, (size_t)(s - seg));
+			monitor_write_data("\r\n", 2);
+			seg = s + 1;
+		}
+	}
+	if (s > seg)
+		monitor_write_data(seg, (size_t)(s - seg));
+}
+
+static void monitor_io_init(void)
+{
+	if (mon_input == NULL)
+		mon_input = stdin;
+	if (mon_output == NULL)
+		mon_output = stdout;
+}
+
+void MONITOR_RequestAction(int action)
+{
+	if (action <= MONITOR_ACTION_NONE || action > MONITOR_ACTION_GF)
+		return;
+	monitor_pending_action = action;
+}
+
+static int monitor_take_pending_action(const char *prompt, char *buffer, size_t size)
+{
+	const char *cmd = NULL;
+
+	if (monitor_pending_action == MONITOR_ACTION_NONE)
+		return FALSE;
+	switch (monitor_pending_action) {
+	case MONITOR_ACTION_CONT:
+		cmd = "CONT";
+		break;
+	case MONITOR_ACTION_STEP:
+		cmd = "G";
+		break;
+	case MONITOR_ACTION_GF:
+		cmd = "GF";
+		break;
+	default:
+		return FALSE;
+	}
+	Util_strlcpy(buffer, cmd, size);
+	monitor_pending_action = MONITOR_ACTION_NONE;
+	return TRUE;
+}
+
+static void monitor_printf(const char *format, ...)
+{
+	char stackbuf[4096];
+	char *buf = stackbuf;
+	va_list args_copy;
+	int needed;
+	va_list args;
+	va_start(args, format);
+	va_copy(args_copy, args);
+	needed = vsnprintf(stackbuf, sizeof(stackbuf), format, args);
+	va_end(args);
+	if (needed < 0) {
+		va_end(args_copy);
+		return;
+	}
+	if ((size_t)needed >= sizeof(stackbuf)) {
+		buf = (char *)malloc((size_t)needed + 1);
+		if (buf == NULL) {
+			va_end(args_copy);
+			return;
+		}
+		vsnprintf(buf, (size_t)needed + 1, format, args_copy);
+	}
+	else {
+		memcpy(buf, stackbuf, (size_t)needed + 1);
+	}
+	if (monitor_external_io) {
+		monitor_puts_crlf(monitor_out(), buf);
+		if (!monitor_output_is_socket)
+			fflush(monitor_out());
+	}
+	else {
+		fputs(buf, monitor_out());
+	}
+	if (buf != stackbuf)
+		free(buf);
+	va_end(args_copy);
 }
 
 #define printf            monitor_printf
-#define puts(s)           fputs(s, mon_output)
-#define putchar(c)        fputc(c, mon_output)
+#define puts(s)           (monitor_write_data((s), strlen(s)))
+#define putchar(c)        monitor_putchar(c)
 #define perror(filename)  printf("%s: %s\n", filename, strerror(errno))
 
-#undef stdout
-#define stdout mon_output
-
-#undef stdin
-#define stdin mon_input
-
+#ifdef __PLUS
 #define PLUS_EXIT_MONITOR Misc_FreeMonitorConsole(mon_output, mon_input)
-
-#else /* __PLUS */
-
+#else
 #define PLUS_EXIT_MONITOR
-
-#endif /* __PLUS */
+#endif
 
 UBYTE *trainer_memory = NULL;
 UBYTE *trainer_flags = NULL;
@@ -445,29 +931,41 @@ static const char *utf8_chars[] = {
 
 /* Print an ATASCII character, with support for graphics characters if
 	UTF-8 is available, and inverse video if ANSI is available. */
-static void print_atascii_char(UWORD c) {
+void MONITOR_PrintAtasciiChar(FILE *fp, UBYTE c)
+{
 	int inv = c & 0x80;
 
 #ifdef MONITOR_ANSI
 	/* ESC[7m = reverse video attribute on */
-	if(inv) printf("\x1b[7m");
+	if (inv)
+		fputs("\x1b[7m", fp);
 #else
-	if(inv) {
-		putchar('.');
+	if (inv) {
+		fputc('.', fp);
 		return;
 	}
 #endif /* MONITOR_ANSI */
 
-	printf("%s", utf8_chars[c & 0x7f]);
+	fputs(utf8_chars[c & 0x7f], fp);
 
 #ifdef MONITOR_ANSI
 	/* ESC[0m = all attributes off */
-	if(inv) printf("\x1b[0m");
+	if (inv)
+		fputs("\x1b[0m", fp);
 #endif /* MONITOR_ANSI */
 }
-#else /* MONITOR_UTF8 */
+
 static void print_atascii_char(UWORD c) {
-	putchar((c >= ' ' && c <= 'z' && c != '\x60') ? c : '.');
+	MONITOR_PrintAtasciiChar(monitor_out(), (UBYTE)c);
+}
+#else /* MONITOR_UTF8 */
+void MONITOR_PrintAtasciiChar(FILE *fp, UBYTE c)
+{
+	fputc((c >= ' ' && c <= 'z' && c != '\x60') ? c : '.', fp);
+}
+
+static void print_atascii_char(UWORD c) {
+	MONITOR_PrintAtasciiChar(monitor_out(), (UBYTE)c);
 }
 #endif /* MONITOR_UTF8 */
 
@@ -703,12 +1201,210 @@ const UBYTE MONITOR_optype6502[256] = {
 
 static void safe_gets(char *buffer, size_t size, char const *prompt)
 {
+	monitor_input_empty = 0;
+	monitor_input_eof = 0;
+	if (monitor_take_pending_action(prompt, buffer, size))
+		return;
 #ifdef HAVE_FFLUSH
-	fflush(stdout);
+	if (!monitor_output_is_socket)
+		fflush(monitor_out());
+#endif
+
+	if (monitor_external_io) {
+		int fd = fileno(monitor_in());
+		unsigned char ch;
+		size_t pos = 0;
+		int echo_input = 1;
+
+		monitor_write_data(prompt, strlen(prompt));
+		for (;;) {
+			ssize_t n;
+			if (monitor_take_pending_action(prompt, buffer, size))
+				return;
+			if (monitor_queued_byte_valid) {
+				ch = monitor_queued_byte;
+				monitor_queued_byte_valid = 0;
+				n = 1;
+			}
+			else {
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+				if (SocketServer_Enabled()) {
+					for (;;) {
+						struct pollfd pfd;
+						int pr;
+						pfd.fd = fd;
+						pfd.events = POLLIN;
+						pr = poll(&pfd, 1, MONITOR_POLL_MS);
+						if (pr > 0 && (pfd.revents & POLLIN)) {
+							n = read(fd, &ch, 1);
+							break;
+						}
+						if (pr == 0) {
+							SocketServer_Poll();
+							if (!monitor_pause_live_refresh)
+								monitor_live_refresh();
+							if (monitor_take_pending_action(prompt, buffer, size))
+								return;
+							continue;
+						}
+						if (pr < 0 && errno == EINTR)
+							continue;
+						monitor_input_empty = 1;
+						monitor_input_eof = 1;
+						buffer[0] = '\0';
+						return;
+					}
+				}
+				else
+#endif
+				{
+					n = read(fd, &ch, 1);
+				}
+			}
+			if (n <= 0) {
+				monitor_input_empty = 1;
+				monitor_input_eof = 1;
+				buffer[0] = '\0';
+				return;
+			}
+			if (monitor_output_is_socket && ch == 0xff) {
+				unsigned char cmd;
+				if (read(fd, &cmd, 1) != 1) {
+					monitor_input_empty = 1;
+					monitor_input_eof = 1;
+					buffer[0] = '\0';
+					return;
+				}
+				if (cmd == 0xff) {
+					ch = 0xff;
+				}
+				else if (cmd == 0xfa) {
+					unsigned char sb;
+					for (;;) {
+						if (read(fd, &sb, 1) != 1)
+							break;
+						if (sb == 0xff) {
+							if (read(fd, &sb, 1) != 1)
+								break;
+							if (sb == 0xf0)
+								break;
+						}
+					}
+					continue;
+				}
+				else if (cmd == 0xf4 || cmd == 0xf3 || cmd == 0xf2) {
+					continue;
+				}
+				else if (cmd == 0xfb || cmd == 0xfc || cmd == 0xfd || cmd == 0xfe) {
+					unsigned char opt;
+					(void)read(fd, &opt, 1);
+					continue;
+				}
+				else {
+					continue;
+				}
+			}
+			if (ch == '\r' || ch == '\n') {
+#ifdef HAVE_UNISTD_H
+				if (ch == '\r') {
+					struct pollfd pfd;
+					unsigned char next;
+					pfd.fd = fd;
+					pfd.events = POLLIN;
+					if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+						if (read(fd, &next, 1) == 1 && next != '\n')
+							MONITOR_QueueInputByte(next);
+					}
+				}
+#endif
+				monitor_write_data("\r\n", 2);
+				break;
+			}
+			if (ch == 0x08 || ch == 0x7f) {
+				if (pos > 0) {
+					pos--;
+					if (echo_input)
+						monitor_write_data("\b \b", 3);
+				}
+				continue;
+			}
+			if (ch < 0x20 || ch == 0x7f)
+				continue;
+			if (pos + 1 < size) {
+				buffer[pos++] = (char)ch;
+				if (echo_input)
+					monitor_putchar(ch);
+			}
+		}
+		buffer[pos] = '\0';
+		return;
+	}
+
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (SocketServer_Enabled()) {
+		int fd = fileno(monitor_in());
+		unsigned char ch;
+		size_t pos = 0;
+
+		monitor_write_data(prompt, strlen(prompt));
+		for (;;) {
+			ssize_t n;
+			struct pollfd pfd;
+			int pr;
+
+			if (monitor_take_pending_action(prompt, buffer, size))
+				return;
+			pfd.fd = fd;
+			pfd.events = POLLIN;
+			pr = poll(&pfd, 1, MONITOR_POLL_MS);
+			if (pr == 0) {
+				SocketServer_Poll();
+				if (!monitor_pause_live_refresh)
+					monitor_live_refresh();
+				if (monitor_take_pending_action(prompt, buffer, size))
+					return;
+				continue;
+			}
+			if (pr < 0) {
+				if (errno == EINTR)
+					continue;
+				buffer[0] = '\0';
+				return;
+			}
+			if (!(pfd.revents & POLLIN))
+				continue;
+			n = read(fd, &ch, 1);
+			if (n <= 0) {
+				buffer[0] = '\0';
+				return;
+			}
+			if (ch == '\r' || ch == '\n') {
+				monitor_write_data("\r\n", 2);
+				break;
+			}
+			if (ch == 0x08 || ch == 0x7f) {
+				if (pos > 0) {
+					pos--;
+					monitor_write_data("\b \b", 3);
+				}
+				continue;
+			}
+			if (ch < 0x20 || ch == 0x7f)
+				continue;
+			if (pos + 1 < size) {
+				buffer[pos++] = (char)ch;
+				monitor_putchar(ch);
+			}
+		}
+		buffer[pos] = '\0';
+		return;
+	}
 #endif
 
 #ifdef MONITOR_READLINE
 	{
+		rl_instream = monitor_in();
+		rl_outstream = monitor_out();
 		char *got = readline(prompt);
 		if (got) {
 			strncpy(buffer, got, size);
@@ -719,8 +1415,8 @@ static void safe_gets(char *buffer, size_t size, char const *prompt)
 		}
 	}
 #else
-	fputs(prompt, stdout);
-	if (fgets(buffer, size, stdin) == NULL)
+	monitor_write_data(prompt, strlen(prompt));
+	if (fgets(buffer, size, monitor_in()) == NULL)
 		buffer[0] = 0;
 #endif
 	Util_chomp(buffer);
@@ -911,13 +1607,13 @@ static UWORD show_instruction(FILE *fp, UWORD pc)
 		if (*p == '1') {
 			value = MEMORY_SafeGetByte(pc);
 			pc++;
-			nchars = fprintf(fp, "%04X: %02X %02X     " /*"%Xcyc  "*/ "%.*s$%02X%s",
+			nchars = monitor_fprintf(fp, "%04X: %02X %02X     " /*"%Xcyc  "*/ "%.*s$%02X%s",
 			                 addr, insn, value, /*cycles[insn],*/ (int) (p - mnemonic), mnemonic, value, p + 1);
 			break;
 		}
 		if (*p == '2') {
 			value = MEMORY_SafeGetByte(pc) + (MEMORY_SafeGetByte(pc + 1) << 8);
-			nchars = fprintf(fp, "%04X: %02X %02X %02X  " /*"%Xcyc  "*/ "%.*s$%04X%s",
+			nchars = monitor_fprintf(fp, "%04X: %02X %02X %02X  " /*"%Xcyc  "*/ "%.*s$%04X%s",
 			                 addr, insn, value & 0xff, value >> 8, /*cycles[insn],*/ (int) (p - mnemonic), mnemonic, value, p + 1);
 			pc += 2;
 			break;
@@ -926,12 +1622,12 @@ static UWORD show_instruction(FILE *fp, UWORD pc)
 			UBYTE op = MEMORY_SafeGetByte(pc);
 			pc++;
 			value = (UWORD) (pc + (SBYTE) op);
-			nchars = fprintf(fp, "%04X: %02X %02X     " /*"3cyc  "*/ "%.4s$%04X", addr, insn, op, mnemonic, value);
+			nchars = monitor_fprintf(fp, "%04X: %02X %02X     " /*"3cyc  "*/ "%.4s$%04X", addr, insn, op, mnemonic, value);
 			break;
 		}
 	}
 	if (*p == '\0') {
-		fprintf(fp, "%04X: %02X        " /*"%Xcyc  "*/ "%s\n", addr, insn, /*cycles[insn],*/ mnemonic);
+		monitor_fprintf(fp, "%04X: %02X        " /*"%Xcyc  "*/ "%s\n", addr, insn, /*cycles[insn],*/ mnemonic);
 		return pc;
 	}
 #ifdef MONITOR_HINTS
@@ -939,14 +1635,14 @@ static UWORD show_instruction(FILE *fp, UWORD pc)
 		/* different names when reading/writing memory */
 		const char *label = find_label_name((UWORD) value, (MONITOR_optype6502[insn] & 0x08) != 0);
 		if (label != NULL) {
-			fprintf(fp, "%*s;%s\n", 28 - nchars, "", label);
+			monitor_fprintf(fp, "%*s;%s\n", 28 - nchars, "", label);
 			return pc;
 		}
 	}
 #else
 	(void)nchars;
 #endif
-	fputc('\n', fp);
+	monitor_fputc('\n', fp);
 	return pc;
 }
 
@@ -962,7 +1658,7 @@ void MONITOR_Exit(void)
 void MONITOR_ShowState(FILE *fp, UWORD pc, UBYTE a, UBYTE x, UBYTE y, UBYTE s,
                 char n, char v, char z, char c)
 {
-	fprintf(fp, "%3d %3d A=%02X X=%02X Y=%02X S=%02X P=%c%c*-%c%c%c%c PC=",
+	monitor_fprintf(fp, "%3d %3d A=%02X X=%02X Y=%02X S=%02X P=%c%c*-%c%c%c%c PC=",
 		ANTIC_ypos, ANTIC_XPOS, a, x, y, s,
 		n, v, (CPU_regP & CPU_D_FLAG) ? 'D' : '-', (CPU_regP & CPU_I_FLAG) ? 'I' : '-', z, c);
 	show_instruction(fp, pc);
@@ -970,7 +1666,7 @@ void MONITOR_ShowState(FILE *fp, UWORD pc, UBYTE a, UBYTE x, UBYTE y, UBYTE s,
 
 static void show_state(void)
 {
-	MONITOR_ShowState(stdout, CPU_regPC, CPU_regA, CPU_regX, CPU_regY, CPU_regS,
+	MONITOR_ShowState(monitor_out(), CPU_regPC, CPU_regA, CPU_regX, CPU_regY, CPU_regS,
 		(char) ((CPU_regP & CPU_N_FLAG) ? 'N' : '-'), (char) ((CPU_regP & CPU_V_FLAG) ? 'V' : '-'),
 		(char) ((CPU_regP & CPU_Z_FLAG) ? 'Z' : '-'), (char) ((CPU_regP & CPU_C_FLAG) ? 'C' : '-'));
 }
@@ -979,7 +1675,7 @@ static UWORD disassemble(UWORD addr)
 {
 	int count = 24;
 	do
-		addr = show_instruction(stdout, addr);
+		addr = show_instruction(monitor_out(), addr);
 	while (--count > 0);
 	return addr;
 }
@@ -1553,7 +2249,7 @@ static void show_history(void)
 			save_op[k] = MEMORY_SafeGetByte(saved_cpu + k);
 			MEMORY_dPutByte(saved_cpu + k, CPU_remember_op[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS][k]);
 		}
-		show_instruction(stdout, CPU_remember_PC[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS]);
+		show_instruction(monitor_out(), CPU_remember_PC[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS]);
 		for (k = 0; k < 3; k++) {
 			MEMORY_dPutByte(saved_cpu + k, save_op[k]);
 		}
@@ -1565,7 +2261,7 @@ static void show_last_jumps(void)
 {
 	int i;
 	for (i = 0; i < CPU_REMEMBER_JMP_STEPS; i++)
-		show_instruction(stdout, CPU_remember_JMP[(CPU_remember_jmp_curpos + i) % CPU_REMEMBER_JMP_STEPS]);
+		show_instruction(monitor_out(), CPU_remember_JMP[(CPU_remember_jmp_curpos + i) % CPU_REMEMBER_JMP_STEPS]);
 }
 
 /* Stesp over the current instruction. */
@@ -1869,7 +2565,7 @@ static void print_coverage_detail(UWORD addr)
 			MONITOR_coverage[addr].cycles,
 			100.0f * (float)MONITOR_coverage[addr].cycles / (float)MONITOR_coverage_cycles);
 	printf("  ");
-	show_instruction(stdout, addr);
+	show_instruction(monitor_out(), addr);
 }
 
 typedef struct {
@@ -2131,6 +2827,7 @@ static void monitor_set_ROM(void)
 	UWORD addr2;
 	if (get_attrib_range(&addr1, &addr2)) {
 		MEMORY_SetROM(addr1, addr2);
+		MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Changed memory from %04X to %04X into ROM\n",
 			   addr1, addr2);
 	}
@@ -2143,6 +2840,7 @@ static void monitor_set_RAM(void)
 	UWORD addr2;
 	if (get_attrib_range(&addr1, &addr2)) {
 		MEMORY_SetRAM(addr1, addr2);
+		MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Changed memory from %04X to %04X into RAM\n",
 			   addr1, addr2);
 	}
@@ -2156,6 +2854,7 @@ static void monitor_set_hardware(void)
 	UWORD addr2;
 	if (get_attrib_range(&addr1, &addr2)) {
 		MEMORY_SetHARDWARE(addr1, addr2);
+		MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Changed memory from %04X to %04X into HARDWARE\n",
 			   addr1, addr2);
 	}
@@ -2222,6 +2921,7 @@ static void monitor_read_from_file(UWORD *addr)
 						printf("Bad xex file\n");
 						break;
 					}
+					MONITOR_NOTIFY_STATE_CHANGED();
 					printf("Read dos block: %04X-%04X, %04X bytes. \n",fromaddr,toaddr, nbytes);
 				}
 				fclose(f);
@@ -2245,6 +2945,8 @@ static void monitor_read_from_file(UWORD *addr)
 						/* read as many bytes as given or available */
 						if ((nbytes=fread(&MEMORY_mem[*addr], 1, nbytes, f)) == 0)
 							printf("Could not read bytes\n");
+						else
+							MONITOR_NOTIFY_STATE_CHANGED();
 						fclose(f);
 					}
 					printf("Read %d bytes at %04X-%04X\n",nbytes,*addr,*addr+nbytes-1);
@@ -2389,6 +3091,7 @@ static void monitor_fill_mem(void)
 			MEMORY_dPutByte(a, tab[c++]);
 			if (c>=n) c=0;
 		}
+		MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Filled %04X-%04X with [",addr1,addr2);
 		for (c=0; c<n; c++) printf("%s%02x",c?" ":"",tab[c]);
 		printf("]\n");
@@ -2430,6 +3133,8 @@ static void monitor_change_mem(UWORD *addr)
 				(*addr)++;
 			}
 		}
+		if (*addr != taddr)
+			MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Changed %d bytes\n",*addr-taddr);
 		return;
 	}
@@ -2971,6 +3676,11 @@ static char screen_to_asc(char c) {
 	return c | bit7;
 }
 
+UBYTE MONITOR_ScreenToAtascii(UBYTE c)
+{
+	return (UBYTE)screen_to_asc((char)c);
+}
+
 static char asc_to_screen(char c) {
 	char bit7 = c & 0x80;
 	c &= 0x7f;
@@ -3110,6 +3820,9 @@ static void show_help(void)
 	printf(
 		"CONT [addr]                    - Continue emulation (default addr=PC)\n"
 		"SHOW                           - Show registers\n"
+		"SYNC                           - Sync OS shadows and refresh video\n"
+		"VFRAME                         - Run one full frame with CPU and refresh video\n"
+		"GF [addr]                      - Step one instruction, then run one frame\n"
 		"STACK                          - Show stack\n"
 		"SET{PC,A,X,Y,S} hexval         - Set register value\n"
 		"SET{N,V,D,I,Z,C} 0 or 1        - Set flag value\n"
@@ -3509,6 +4222,7 @@ static void fp_to_hex(int store) {
 			MEMORY_PutByte(addr, fp[i]);
 			addr++;
 		}
+		MONITOR_NOTIFY_STATE_CHANGED();
 	}
 }
 
@@ -3527,7 +4241,7 @@ static char *command_generator(const char *text, int state)
 	const char *name;
 
 	static const char *commands[] = {
-		"CONT", "SHOW", "STACK", "LOOP", "HARDWARE", "READ", "WRITE",
+		"CONT", "SHOW", "SYNC", "VFRAME", "STACK", "LOOP", "HARDWARE", "READ", "WRITE",
 #ifdef MONITOR_TRACE
 		"TRACE",
 #endif
@@ -3776,14 +4490,46 @@ void MONITOR_BPC(char *arg)
 int MONITOR_Run(void)
 {
 	UWORD addr;
+	int first_prompt = 1;
+	int pause_live_refresh = 0;
+#ifdef SOUND
+	int live_audio_started = 0;
+#endif
+	static int monitor_gf_pending = 0;
+#ifdef SOUND
+#define MONITOR_RETURN(val) do { \
+	if (live_audio_started) \
+		Sound_Pause(); \
+	monitor_active = 0; \
+	monitor_pause_live_refresh = 0; \
+	return (val); \
+} while (0)
+#else
+#define MONITOR_RETURN(val) do { \
+	monitor_active = 0; \
+	monitor_pause_live_refresh = 0; \
+	return (val); \
+} while (0)
+#endif
 
 #ifdef __PLUS
 	if (!Misc_AllocMonitorConsole(&mon_output, &mon_input))
 		return TRUE;
 #endif
 
+	monitor_io_init();
+	monitor_active = 1;
+	monitor_pause_live_refresh = 0;
+
 #ifdef MONITOR_READLINE
 	init_readline();
+#endif
+
+#ifdef SOUND
+	if (Atari800_live_monitor_audio) {
+		Sound_Continue();
+		live_audio_started = 1;
+	}
 #endif
 
 	addr = CPU_regPC;
@@ -3812,16 +4558,46 @@ int MONITOR_Run(void)
 #endif /* MONITOR_BREAK */
 
 	show_state();
+	if (monitor_gf_pending) {
+		monitor_run_frame(TRUE, Atari800_live_monitor_audio);
+		monitor_gf_pending = 0;
+		pause_live_refresh = 1;
+		monitor_pause_live_refresh = 1;
+	}
 
 	for (;;) {
 		char s[128];
 		static char old_s[128];
 		char *t;
 
-		safe_gets(s, sizeof(s), "> ");
-		if (s[0] != '\0')
-			strcpy(old_s, s);
+		if (!pause_live_refresh)
+			monitor_live_refresh();
+		if (first_prompt)
+			monitor_drain_pending_input();
+		if (monitor_take_pending_action("> ", s, sizeof(s))) {
+			/* already filled */
+		}
 		else {
+			safe_gets(s, sizeof(s), "> ");
+			if (monitor_external_io && monitor_input_empty) {
+				if (monitor_input_eof)
+					MONITOR_RETURN(TRUE);
+				continue;
+			}
+		}
+		if (s[0] != '\0') {
+			strcpy(old_s, s);
+		}
+		else {
+			if (monitor_external_io && monitor_output_is_socket) {
+				if (first_prompt)
+					first_prompt = 0;
+				continue;
+			}
+			if (first_prompt) {
+				first_prompt = 0;
+				continue;
+			}
 			/* if no command is given, restart the last one, but remove all
 			 * arguments, so after a 'm 600' we will see 'm 700' ... */
 			int i;
@@ -3841,6 +4617,7 @@ int MONITOR_Run(void)
 		}
 #endif
 		token_ptr = s;
+		first_prompt = 0;
 		t = get_token();
 		if (t == NULL)
 			continue;
@@ -3854,7 +4631,7 @@ int MONITOR_Run(void)
 			memset(CPU_instruction_count, 0, sizeof(CPU_instruction_count));
 #endif /* MONITOR_PROFILE */
 			PLUS_EXIT_MONITOR;
-			return TRUE;
+			MONITOR_RETURN(TRUE);
 		}
 #ifdef MONITOR_BREAK
 		else if (strcmp(t, "BBRK") == 0)
@@ -3869,21 +4646,28 @@ int MONITOR_Run(void)
 			if(get_hex(&addr)) CPU_regPC = addr;
 			MONITOR_break_step = TRUE;
 			PLUS_EXIT_MONITOR;
-			return TRUE;
+			MONITOR_RETURN(TRUE);
+		}
+		else if (strcmp(t, "GF") == 0) {
+			if(get_hex(&addr)) CPU_regPC = addr;
+			monitor_gf_pending = 1;
+			MONITOR_break_step = TRUE;
+			PLUS_EXIT_MONITOR;
+			MONITOR_RETURN(TRUE);
 		}
 		else if (strcmp(t, "R") == 0 ) {
 			if(get_hex(&addr)) CPU_regPC = addr;
 			MONITOR_break_ret = TRUE;
 			MONITOR_ret_nesting = 1;
 			PLUS_EXIT_MONITOR;
-			return TRUE;
+			MONITOR_RETURN(TRUE);
 		}
 		else if (strcmp(t, "O") == 0) {
 			if(get_hex(&addr)) CPU_regPC = addr;
 			get_hex(&addr);
 			step_over();
 			PLUS_EXIT_MONITOR;
-			return TRUE;
+			MONITOR_RETURN(TRUE);
 		}
 #endif /* MONITOR_BREAK */
 #if defined(MONITOR_BREAK) || !defined(NO_YPOS_BREAK_FLICKER)
@@ -3928,6 +4712,13 @@ int MONITOR_Run(void)
 #endif /* MONITOR_PROFILE */
 		else if (strcmp(t, "SHOW") == 0)
 			show_state();
+		else if (strcmp(t, "SYNC") == 0)
+			monitor_force_refresh(TRUE, Atari800_live_monitor_audio);
+		else if (strcmp(t, "VFRAME") == 0)
+		{
+			monitor_run_frame(TRUE, Atari800_live_monitor_audio);
+			pause_live_refresh = 1;
+		}
 		else if (strcmp(t, "STACK") == 0)
 			show_stack();
 		else if (strcmp(t, "ROM") == 0)
@@ -3942,13 +4733,15 @@ int MONITOR_Run(void)
 			show_CARTRIDGE();
 		else if (strcmp(t, "COLDSTART") == 0) {
 			Atari800_Coldstart();
+			MONITOR_NOTIFY_STATE_CHANGED();
 			PLUS_EXIT_MONITOR;
-			return TRUE;	/* perform reboot immediately */
+			MONITOR_RETURN(TRUE);	/* perform reboot immediately */
 		}
 		else if (strcmp(t, "WARMSTART") == 0) {
 			Atari800_Warmstart();
+			MONITOR_NOTIFY_STATE_CHANGED();
 			PLUS_EXIT_MONITOR;
-			return TRUE;	/* perform reboot immediately */
+			MONITOR_RETURN(TRUE);	/* perform reboot immediately */
 		}
 #ifndef PAGED_MEM
 		else if (strcmp(t, "READ") == 0)
@@ -4064,7 +4857,7 @@ int MONITOR_Run(void)
 			show_help();
 		else if (strcmp(t, "QUIT") == 0 || strcmp(t, "EXIT") == 0) {
 			PLUS_EXIT_MONITOR;
-			return FALSE;
+			MONITOR_RETURN(FALSE);
 		} else if(t[0] == '*' || t[0] == '@') {
 			UWORD val;
 			if(parse_hex(t, &val))
@@ -4075,6 +4868,8 @@ int MONITOR_Run(void)
 			printf("Invalid command!\n");
 	}
 }
+
+#undef MONITOR_RETURN
 
 /*
 vim:ts=4:sw=4:

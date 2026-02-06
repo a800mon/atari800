@@ -7,6 +7,20 @@
 #include "atari.h"
 
 int MONITOR_Run(void);
+void MONITOR_SetIO(FILE *input, FILE *output);
+void MONITOR_ResetIO(void);
+void MONITOR_QueueInputByte(int ch);
+void MONITOR_SetOutputSocket(int fd);
+int MONITOR_IsActive(void);
+int MONITOR_EnableHeadlessIO(void);
+void MONITOR_DisableHeadlessIO(void);
+#define MONITOR_ACTION_NONE 0
+#define MONITOR_ACTION_CONT 1
+#define MONITOR_ACTION_STEP 2
+#define MONITOR_ACTION_GF 3
+void MONITOR_RequestAction(int action);
+UBYTE MONITOR_ScreenToAtascii(UBYTE c);
+void MONITOR_PrintAtasciiChar(FILE *fp, UBYTE c);
 
 #ifdef MONITOR_HINTS
 void MONITOR_PreloadLabelFile(char *filename);
