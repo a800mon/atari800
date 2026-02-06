@@ -28,6 +28,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <errno.h>
+#ifdef HAVE_UNISTD_H
+#include <poll.h>
+#endif
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -49,11 +54,20 @@
 #include "pia.h"
 #include "pokey.h"
 #include "util.h"
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+#include "remotemonitor.h"
+#define MONITOR_NOTIFY_STATE_CHANGED() RemoteMonitor_NotifyStateChanged()
+#else
+#define MONITOR_NOTIFY_STATE_CHANGED() do { } while (0)
+#endif
 #ifdef STEREO_SOUND
 #include "pokeysnd.h"
 #endif
 #include "platform.h"
 #include "statesav.h"
+#ifdef SOUND
+#include "sound.h"
+#endif
 
 #ifdef MONITOR_READLINE
 #include <readline/readline.h>
@@ -61,38 +75,260 @@
 #endif
 
 #ifdef __PLUS
-
-#include <stdarg.h>
 #include "misc_win.h"
+#endif
 
-FILE *mon_output, *mon_input;
+#define MONITOR_POLL_MS 1
 
-void monitor_printf(const char *format, ...)
+static FILE *mon_output = NULL;
+static FILE *mon_input = NULL;
+static int monitor_input_empty = 0;
+static int monitor_input_eof = 0;
+static int monitor_queued_byte_valid = 0;
+static unsigned char monitor_queued_byte = 0;
+static int monitor_pending_action = MONITOR_ACTION_NONE;
+static int monitor_active = 0;
+static int monitor_remote_enabled = 0;
+int MONITOR_breaks_deferred = FALSE;
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+static int monitor_remote_enabled_pipe_w = -1;
+static FILE *monitor_remote_enabled_in = NULL;
+static FILE *monitor_remote_enabled_out = NULL;
+#endif
+
+void MONITOR_SetIO(FILE *input, FILE *output)
+{
+	mon_input = input;
+	mon_output = output;
+}
+
+void MONITOR_ResetIO(void)
+{
+	mon_input = NULL;
+	mon_output = NULL;
+}
+
+int MONITOR_IsActive(void)
+{
+	return monitor_active;
+}
+
+int MONITOR_EnableRemoteEnabledIO(void)
+{
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	int fds[2];
+
+	if (monitor_remote_enabled)
+		return 1;
+	if (pipe(fds) < 0)
+		return 0;
+	monitor_remote_enabled_in = fdopen(fds[0], "r");
+	if (monitor_remote_enabled_in == NULL) {
+		close(fds[0]);
+		close(fds[1]);
+		return 0;
+	}
+	monitor_remote_enabled_out = fopen("/dev/null", "w");
+	if (monitor_remote_enabled_out == NULL) {
+		fclose(monitor_remote_enabled_in);
+		monitor_remote_enabled_in = NULL;
+		close(fds[1]);
+		return 0;
+	}
+	monitor_remote_enabled_pipe_w = fds[1];
+	MONITOR_SetIO(monitor_remote_enabled_in, monitor_remote_enabled_out);
+	monitor_remote_enabled = 1;
+	return 1;
+#else
+	return 0;
+#endif
+}
+
+void MONITOR_DisableRemoteEnabledIO(void)
+{
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (!monitor_remote_enabled)
+		return;
+	MONITOR_ResetIO();
+	if (monitor_remote_enabled_in != NULL) {
+		fclose(monitor_remote_enabled_in);
+		monitor_remote_enabled_in = NULL;
+	}
+	if (monitor_remote_enabled_out != NULL) {
+		fclose(monitor_remote_enabled_out);
+		monitor_remote_enabled_out = NULL;
+	}
+	if (monitor_remote_enabled_pipe_w >= 0) {
+		close(monitor_remote_enabled_pipe_w);
+		monitor_remote_enabled_pipe_w = -1;
+	}
+	monitor_remote_enabled = 0;
+#endif
+}
+
+void MONITOR_QueueInputByte(int ch)
+{
+	monitor_queued_byte = (unsigned char)ch;
+	monitor_queued_byte_valid = 1;
+}
+
+static FILE *monitor_out(void)
+{
+	return mon_output != NULL ? mon_output : stdout;
+}
+
+static FILE *monitor_in(void)
+{
+	return mon_input != NULL ? mon_input : stdin;
+}
+
+static int monitor_write_data(const char *buf, size_t len)
+{
+	if (len == 0)
+		return 0;
+	return (fwrite(buf, 1, len, monitor_out()) == len) ? 0 : -1;
+}
+
+static int monitor_putchar(int c)
+{
+	char ch = (char)c;
+	monitor_write_data(&ch, 1);
+	return (unsigned char)c;
+}
+
+static int monitor_fprintf(FILE *fp, const char *format, ...)
 {
 	va_list args;
+	int needed;
+
 	va_start(args, format);
-	vfprintf(mon_output, format, args);
+	needed = vfprintf(fp, format, args);
 	va_end(args);
+	return needed;
+}
+
+static int monitor_fputc(int c, FILE *fp)
+{
+	return fputc(c, fp);
+}
+
+static void monitor_io_init(void)
+{
+	if (mon_input == NULL)
+		mon_input = stdin;
+	if (mon_output == NULL)
+		mon_output = stdout;
+}
+
+static void monitor_puts_crlf(FILE *out, const char *s)
+{
+	const char *seg = s;
+	(void)out;
+	for (; *s != '\0'; s++) {
+		if (*s == '\n') {
+			if (s > seg)
+				monitor_write_data(seg, (size_t)(s - seg));
+			monitor_write_data("\r\n", 2);
+			seg = s + 1;
+		}
+	}
+	if (s > seg)
+		monitor_write_data(seg, (size_t)(s - seg));
+}
+
+void MONITOR_RequestAction(int action)
+{
+	if (action <= MONITOR_ACTION_NONE || action > MONITOR_ACTION_RUN_RETURN)
+		return;
+	monitor_pending_action = action;
+}
+
+static int monitor_take_pending_action(const char *prompt, char *buffer, size_t size)
+{
+	const char *cmd = NULL;
+
+	if (monitor_pending_action == MONITOR_ACTION_NONE)
+		return FALSE;
+	switch (monitor_pending_action) {
+	case MONITOR_ACTION_CONT:
+		cmd = "CONT";
+		break;
+	case MONITOR_ACTION_STEP:
+		cmd = "G";
+		break;
+	case MONITOR_ACTION_GF:
+		cmd = "GF";
+		break;
+	case MONITOR_ACTION_STEP_OVER:
+#ifdef MONITOR_BREAK
+		cmd = "O";
+		break;
+#else
+		return FALSE;
+#endif
+	case MONITOR_ACTION_RUN_RETURN:
+#ifdef MONITOR_BREAK
+		cmd = "R";
+		break;
+#else
+		return FALSE;
+#endif
+	default:
+		return FALSE;
+	}
+	Util_strlcpy(buffer, cmd, size);
+	monitor_pending_action = MONITOR_ACTION_NONE;
+	return TRUE;
+}
+
+static void monitor_printf(const char *format, ...)
+{
+	char stackbuf[4096];
+	char *buf = stackbuf;
+	va_list args_copy;
+	int needed;
+	va_list args;
+	va_start(args, format);
+	va_copy(args_copy, args);
+	needed = vsnprintf(stackbuf, sizeof(stackbuf), format, args);
+	va_end(args);
+	if (needed < 0) {
+		va_end(args_copy);
+		return;
+	}
+	if ((size_t)needed >= sizeof(stackbuf)) {
+		buf = (char *)malloc((size_t)needed + 1);
+		if (buf == NULL) {
+			va_end(args_copy);
+			return;
+		}
+		vsnprintf(buf, (size_t)needed + 1, format, args_copy);
+	}
+	else {
+		memcpy(buf, stackbuf, (size_t)needed + 1);
+	}
+	if (monitor_remote_enabled) {
+		monitor_puts_crlf(monitor_out(), buf);
+		fflush(monitor_out());
+	}
+	else {
+		fputs(buf, monitor_out());
+	}
+	if (buf != stackbuf)
+		free(buf);
+	va_end(args_copy);
 }
 
 #define printf            monitor_printf
-#define puts(s)           fputs(s, mon_output)
-#define putchar(c)        fputc(c, mon_output)
+#define puts(s)           (monitor_write_data((s), strlen(s)))
+#define putchar(c)        monitor_putchar(c)
 #define perror(filename)  printf("%s: %s\n", filename, strerror(errno))
 
-#undef stdout
-#define stdout mon_output
-
-#undef stdin
-#define stdin mon_input
-
+#ifdef __PLUS
 #define PLUS_EXIT_MONITOR Misc_FreeMonitorConsole(mon_output, mon_input)
-
-#else /* __PLUS */
-
+#else
 #define PLUS_EXIT_MONITOR
-
-#endif /* __PLUS */
+#endif
 
 UBYTE *trainer_memory = NULL;
 UBYTE *trainer_flags = NULL;
@@ -445,29 +681,41 @@ static const char *utf8_chars[] = {
 
 /* Print an ATASCII character, with support for graphics characters if
 	UTF-8 is available, and inverse video if ANSI is available. */
-static void print_atascii_char(UWORD c) {
+void MONITOR_PrintAtasciiChar(FILE *fp, UBYTE c)
+{
 	int inv = c & 0x80;
 
 #ifdef MONITOR_ANSI
 	/* ESC[7m = reverse video attribute on */
-	if(inv) printf("\x1b[7m");
+	if (inv)
+		fputs("\x1b[7m", fp);
 #else
-	if(inv) {
-		putchar('.');
+	if (inv) {
+		fputc('.', fp);
 		return;
 	}
 #endif /* MONITOR_ANSI */
 
-	printf("%s", utf8_chars[c & 0x7f]);
+	fputs(utf8_chars[c & 0x7f], fp);
 
 #ifdef MONITOR_ANSI
 	/* ESC[0m = all attributes off */
-	if(inv) printf("\x1b[0m");
+	if (inv)
+		fputs("\x1b[0m", fp);
 #endif /* MONITOR_ANSI */
 }
-#else /* MONITOR_UTF8 */
+
 static void print_atascii_char(UWORD c) {
-	putchar((c >= ' ' && c <= 'z' && c != '\x60') ? c : '.');
+	MONITOR_PrintAtasciiChar(monitor_out(), (UBYTE)c);
+}
+#else /* MONITOR_UTF8 */
+void MONITOR_PrintAtasciiChar(FILE *fp, UBYTE c)
+{
+	fputc((c >= ' ' && c <= 'z' && c != '\x60') ? c : '.', fp);
+}
+
+static void print_atascii_char(UWORD c) {
+	MONITOR_PrintAtasciiChar(monitor_out(), (UBYTE)c);
 }
 #endif /* MONITOR_UTF8 */
 
@@ -703,12 +951,124 @@ const UBYTE MONITOR_optype6502[256] = {
 
 static void safe_gets(char *buffer, size_t size, char const *prompt)
 {
+	monitor_input_empty = 0;
+	monitor_input_eof = 0;
+	if (monitor_take_pending_action(prompt, buffer, size))
+		return;
 #ifdef HAVE_FFLUSH
-	fflush(stdout);
+	fflush(monitor_out());
 #endif
+
+	if (monitor_remote_enabled) {
+		int fd = fileno(monitor_in());
+		unsigned char ch;
+		size_t pos = 0;
+		int echo_input = 1;
+
+		monitor_write_data(prompt, strlen(prompt));
+		for (;;) {
+			ssize_t n;
+			if (monitor_take_pending_action(prompt, buffer, size))
+				return;
+			if (monitor_queued_byte_valid) {
+				ch = monitor_queued_byte;
+				monitor_queued_byte_valid = 0;
+				n = 1;
+			}
+			else {
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+				for (;;) {
+					struct pollfd pfd;
+					int pr;
+
+					if (Atari800_IsSigintPending()) {
+						monitor_input_empty = 1;
+						monitor_input_eof = 1;
+						buffer[0] = '\0';
+						return;
+					}
+					if (!RemoteMonitor_Enabled()) {
+						monitor_input_empty = 1;
+						monitor_input_eof = 1;
+						buffer[0] = '\0';
+						return;
+					}
+					pfd.fd = fd;
+					pfd.events = POLLIN;
+					pr = poll(&pfd, 1, MONITOR_POLL_MS);
+					if (pr > 0 && (pfd.revents & POLLIN)) {
+						n = read(fd, &ch, 1);
+						break;
+					}
+					if (pr == 0) {
+						RemoteMonitor_Poll();
+						if (!RemoteMonitor_HasClients()) {
+							monitor_input_empty = 1;
+							monitor_input_eof = 1;
+							buffer[0] = '\0';
+							return;
+						}
+						if (monitor_take_pending_action(prompt, buffer, size))
+							return;
+						continue;
+					}
+					if (pr < 0 && errno == EINTR)
+						continue;
+					monitor_input_empty = 1;
+					monitor_input_eof = 1;
+					buffer[0] = '\0';
+					return;
+				}
+#else
+				n = -1;
+#endif
+			}
+			if (n <= 0) {
+				monitor_input_empty = 1;
+				monitor_input_eof = 1;
+				buffer[0] = '\0';
+				return;
+			}
+			if (ch == '\r' || ch == '\n') {
+#ifdef HAVE_UNISTD_H
+				if (ch == '\r') {
+					struct pollfd pfd;
+					unsigned char next;
+					pfd.fd = fd;
+					pfd.events = POLLIN;
+					if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+						if (read(fd, &next, 1) == 1 && next != '\n')
+							MONITOR_QueueInputByte(next);
+					}
+				}
+#endif
+				monitor_write_data("\r\n", 2);
+				break;
+			}
+			if (ch == 0x08 || ch == 0x7f) {
+				if (pos > 0) {
+					pos--;
+					if (echo_input)
+						monitor_write_data("\b \b", 3);
+				}
+				continue;
+			}
+			if (ch < 0x20 || ch == 0x7f)
+				continue;
+			if (pos + 1 < size) {
+				buffer[pos++] = (char)ch;
+				if (echo_input)
+					monitor_putchar(ch);
+			}
+		}
+		buffer[pos] = '\0';
+		return;
+	}
 
 #ifdef MONITOR_READLINE
 	{
+		rl_instream = monitor_in();
+		rl_outstream = monitor_out();
 		char *got = readline(prompt);
 		if (got) {
 			strncpy(buffer, got, size);
@@ -719,8 +1079,8 @@ static void safe_gets(char *buffer, size_t size, char const *prompt)
 		}
 	}
 #else
-	fputs(prompt, stdout);
-	if (fgets(buffer, size, stdin) == NULL)
+	monitor_write_data(prompt, strlen(prompt));
+	if (fgets(buffer, size, monitor_in()) == NULL)
 		buffer[0] = 0;
 #endif
 	Util_chomp(buffer);
@@ -911,13 +1271,13 @@ static UWORD show_instruction(FILE *fp, UWORD pc)
 		if (*p == '1') {
 			value = MEMORY_SafeGetByte(pc);
 			pc++;
-			nchars = fprintf(fp, "%04X: %02X %02X     " /*"%Xcyc  "*/ "%.*s$%02X%s",
+			nchars = monitor_fprintf(fp, "%04X: %02X %02X     " /*"%Xcyc  "*/ "%.*s$%02X%s",
 			                 addr, insn, value, /*cycles[insn],*/ (int) (p - mnemonic), mnemonic, value, p + 1);
 			break;
 		}
 		if (*p == '2') {
 			value = MEMORY_SafeGetByte(pc) + (MEMORY_SafeGetByte(pc + 1) << 8);
-			nchars = fprintf(fp, "%04X: %02X %02X %02X  " /*"%Xcyc  "*/ "%.*s$%04X%s",
+			nchars = monitor_fprintf(fp, "%04X: %02X %02X %02X  " /*"%Xcyc  "*/ "%.*s$%04X%s",
 			                 addr, insn, value & 0xff, value >> 8, /*cycles[insn],*/ (int) (p - mnemonic), mnemonic, value, p + 1);
 			pc += 2;
 			break;
@@ -926,12 +1286,12 @@ static UWORD show_instruction(FILE *fp, UWORD pc)
 			UBYTE op = MEMORY_SafeGetByte(pc);
 			pc++;
 			value = (UWORD) (pc + (SBYTE) op);
-			nchars = fprintf(fp, "%04X: %02X %02X     " /*"3cyc  "*/ "%.4s$%04X", addr, insn, op, mnemonic, value);
+			nchars = monitor_fprintf(fp, "%04X: %02X %02X     " /*"3cyc  "*/ "%.4s$%04X", addr, insn, op, mnemonic, value);
 			break;
 		}
 	}
 	if (*p == '\0') {
-		fprintf(fp, "%04X: %02X        " /*"%Xcyc  "*/ "%s\n", addr, insn, /*cycles[insn],*/ mnemonic);
+		monitor_fprintf(fp, "%04X: %02X        " /*"%Xcyc  "*/ "%s\n", addr, insn, /*cycles[insn],*/ mnemonic);
 		return pc;
 	}
 #ifdef MONITOR_HINTS
@@ -939,14 +1299,14 @@ static UWORD show_instruction(FILE *fp, UWORD pc)
 		/* different names when reading/writing memory */
 		const char *label = find_label_name((UWORD) value, (MONITOR_optype6502[insn] & 0x08) != 0);
 		if (label != NULL) {
-			fprintf(fp, "%*s;%s\n", 28 - nchars, "", label);
+			monitor_fprintf(fp, "%*s;%s\n", 28 - nchars, "", label);
 			return pc;
 		}
 	}
 #else
 	(void)nchars;
 #endif
-	fputc('\n', fp);
+	monitor_fputc('\n', fp);
 	return pc;
 }
 
@@ -962,7 +1322,7 @@ void MONITOR_Exit(void)
 void MONITOR_ShowState(FILE *fp, UWORD pc, UBYTE a, UBYTE x, UBYTE y, UBYTE s,
                 char n, char v, char z, char c)
 {
-	fprintf(fp, "%3d %3d A=%02X X=%02X Y=%02X S=%02X P=%c%c*-%c%c%c%c PC=",
+	monitor_fprintf(fp, "%3d %3d A=%02X X=%02X Y=%02X S=%02X P=%c%c*-%c%c%c%c PC=",
 		ANTIC_ypos, ANTIC_XPOS, a, x, y, s,
 		n, v, (CPU_regP & CPU_D_FLAG) ? 'D' : '-', (CPU_regP & CPU_I_FLAG) ? 'I' : '-', z, c);
 	show_instruction(fp, pc);
@@ -970,7 +1330,7 @@ void MONITOR_ShowState(FILE *fp, UWORD pc, UBYTE a, UBYTE x, UBYTE y, UBYTE s,
 
 static void show_state(void)
 {
-	MONITOR_ShowState(stdout, CPU_regPC, CPU_regA, CPU_regX, CPU_regY, CPU_regS,
+	MONITOR_ShowState(monitor_out(), CPU_regPC, CPU_regA, CPU_regX, CPU_regY, CPU_regS,
 		(char) ((CPU_regP & CPU_N_FLAG) ? 'N' : '-'), (char) ((CPU_regP & CPU_V_FLAG) ? 'V' : '-'),
 		(char) ((CPU_regP & CPU_Z_FLAG) ? 'Z' : '-'), (char) ((CPU_regP & CPU_C_FLAG) ? 'C' : '-'));
 }
@@ -979,7 +1339,7 @@ static UWORD disassemble(UWORD addr)
 {
 	int count = 24;
 	do
-		addr = show_instruction(stdout, addr);
+		addr = show_instruction(monitor_out(), addr);
 	while (--count > 0);
 	return addr;
 }
@@ -1553,7 +1913,7 @@ static void show_history(void)
 			save_op[k] = MEMORY_SafeGetByte(saved_cpu + k);
 			MEMORY_dPutByte(saved_cpu + k, CPU_remember_op[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS][k]);
 		}
-		show_instruction(stdout, CPU_remember_PC[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS]);
+		show_instruction(monitor_out(), CPU_remember_PC[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS]);
 		for (k = 0; k < 3; k++) {
 			MEMORY_dPutByte(saved_cpu + k, save_op[k]);
 		}
@@ -1565,7 +1925,7 @@ static void show_last_jumps(void)
 {
 	int i;
 	for (i = 0; i < CPU_REMEMBER_JMP_STEPS; i++)
-		show_instruction(stdout, CPU_remember_JMP[(CPU_remember_jmp_curpos + i) % CPU_REMEMBER_JMP_STEPS]);
+		show_instruction(monitor_out(), CPU_remember_JMP[(CPU_remember_jmp_curpos + i) % CPU_REMEMBER_JMP_STEPS]);
 }
 
 /* Stesp over the current instruction. */
@@ -1869,7 +2229,7 @@ static void print_coverage_detail(UWORD addr)
 			MONITOR_coverage[addr].cycles,
 			100.0f * (float)MONITOR_coverage[addr].cycles / (float)MONITOR_coverage_cycles);
 	printf("  ");
-	show_instruction(stdout, addr);
+	show_instruction(monitor_out(), addr);
 }
 
 typedef struct {
@@ -2131,6 +2491,7 @@ static void monitor_set_ROM(void)
 	UWORD addr2;
 	if (get_attrib_range(&addr1, &addr2)) {
 		MEMORY_SetROM(addr1, addr2);
+		MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Changed memory from %04X to %04X into ROM\n",
 			   addr1, addr2);
 	}
@@ -2143,6 +2504,7 @@ static void monitor_set_RAM(void)
 	UWORD addr2;
 	if (get_attrib_range(&addr1, &addr2)) {
 		MEMORY_SetRAM(addr1, addr2);
+		MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Changed memory from %04X to %04X into RAM\n",
 			   addr1, addr2);
 	}
@@ -2156,6 +2518,7 @@ static void monitor_set_hardware(void)
 	UWORD addr2;
 	if (get_attrib_range(&addr1, &addr2)) {
 		MEMORY_SetHARDWARE(addr1, addr2);
+		MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Changed memory from %04X to %04X into HARDWARE\n",
 			   addr1, addr2);
 	}
@@ -2222,6 +2585,7 @@ static void monitor_read_from_file(UWORD *addr)
 						printf("Bad xex file\n");
 						break;
 					}
+					MONITOR_NOTIFY_STATE_CHANGED();
 					printf("Read dos block: %04X-%04X, %04X bytes. \n",fromaddr,toaddr, nbytes);
 				}
 				fclose(f);
@@ -2245,6 +2609,8 @@ static void monitor_read_from_file(UWORD *addr)
 						/* read as many bytes as given or available */
 						if ((nbytes=fread(&MEMORY_mem[*addr], 1, nbytes, f)) == 0)
 							printf("Could not read bytes\n");
+						else
+							MONITOR_NOTIFY_STATE_CHANGED();
 						fclose(f);
 					}
 					printf("Read %d bytes at %04X-%04X\n",nbytes,*addr,*addr+nbytes-1);
@@ -2389,6 +2755,7 @@ static void monitor_fill_mem(void)
 			MEMORY_dPutByte(a, tab[c++]);
 			if (c>=n) c=0;
 		}
+		MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Filled %04X-%04X with [",addr1,addr2);
 		for (c=0; c<n; c++) printf("%s%02x",c?" ":"",tab[c]);
 		printf("]\n");
@@ -2430,6 +2797,8 @@ static void monitor_change_mem(UWORD *addr)
 				(*addr)++;
 			}
 		}
+		if (*addr != taddr)
+			MONITOR_NOTIFY_STATE_CHANGED();
 		printf("Changed %d bytes\n",*addr-taddr);
 		return;
 	}
@@ -2971,6 +3340,11 @@ static char screen_to_asc(char c) {
 	return c | bit7;
 }
 
+UBYTE MONITOR_ScreenToAtascii(UBYTE c)
+{
+	return (UBYTE)screen_to_asc((char)c);
+}
+
 static char asc_to_screen(char c) {
 	char bit7 = c & 0x80;
 	c &= 0x7f;
@@ -3110,6 +3484,7 @@ static void show_help(void)
 	printf(
 		"CONT [addr]                    - Continue emulation (default addr=PC)\n"
 		"SHOW                           - Show registers\n"
+					"GF [addr]                      - Continue until next VBL\n"
 		"STACK                          - Show stack\n"
 		"SET{PC,A,X,Y,S} hexval         - Set register value\n"
 		"SET{N,V,D,I,Z,C} 0 or 1        - Set flag value\n"
@@ -3509,6 +3884,7 @@ static void fp_to_hex(int store) {
 			MEMORY_PutByte(addr, fp[i]);
 			addr++;
 		}
+		MONITOR_NOTIFY_STATE_CHANGED();
 	}
 }
 
@@ -3776,14 +4152,41 @@ void MONITOR_BPC(char *arg)
 int MONITOR_Run(void)
 {
 	UWORD addr;
+	int first_prompt = 1;
+#ifdef SOUND
+	int live_audio_started = 0;
+#endif
+#ifdef SOUND
+#define MONITOR_RETURN(val) do { \
+	if (live_audio_started) \
+		Sound_Pause(); \
+	monitor_active = 0; \
+	return (val); \
+} while (0)
+#else
+#define MONITOR_RETURN(val) do { \
+	monitor_active = 0; \
+	return (val); \
+} while (0)
+#endif
 
 #ifdef __PLUS
 	if (!Misc_AllocMonitorConsole(&mon_output, &mon_input))
 		return TRUE;
 #endif
 
+	monitor_io_init();
+	monitor_active = 1;
+
 #ifdef MONITOR_READLINE
 	init_readline();
+#endif
+
+#ifdef SOUND
+	if (monitor_remote_enabled && RemoteMonitor_HasClients() && Atari800_audio_on_debug) {
+		Sound_Continue();
+		live_audio_started = 1;
+	}
 #endif
 
 	addr = CPU_regPC;
@@ -3796,6 +4199,7 @@ int MONITOR_Run(void)
 	}
 
 #ifdef MONITOR_BREAK
+	MONITOR_breaks_deferred = FALSE;
 	if (break_over) {
 		/* "O" command was active */
 		MONITOR_break_addr = 0xd000;
@@ -3818,10 +4222,30 @@ int MONITOR_Run(void)
 		static char old_s[128];
 		char *t;
 
-		safe_gets(s, sizeof(s), "> ");
-		if (s[0] != '\0')
-			strcpy(old_s, s);
+		if (monitor_take_pending_action("> ", s, sizeof(s))) {
+			/* already filled */
+		}
 		else {
+		safe_gets(s, sizeof(s), "> ");
+			if (monitor_remote_enabled && monitor_input_empty) {
+				if (monitor_input_eof) {
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+					if (monitor_remote_enabled && Atari800_IsSigintPending())
+						MONITOR_RETURN(FALSE);
+#endif
+					MONITOR_RETURN(TRUE);
+				}
+				continue;
+			}
+		}
+		if (s[0] != '\0') {
+			strcpy(old_s, s);
+		}
+		else {
+			if (first_prompt) {
+				first_prompt = 0;
+				continue;
+			}
 			/* if no command is given, restart the last one, but remove all
 			 * arguments, so after a 'm 600' we will see 'm 700' ... */
 			int i;
@@ -3841,6 +4265,7 @@ int MONITOR_Run(void)
 		}
 #endif
 		token_ptr = s;
+		first_prompt = 0;
 		t = get_token();
 		if (t == NULL)
 			continue;
@@ -3854,7 +4279,7 @@ int MONITOR_Run(void)
 			memset(CPU_instruction_count, 0, sizeof(CPU_instruction_count));
 #endif /* MONITOR_PROFILE */
 			PLUS_EXIT_MONITOR;
-			return TRUE;
+			MONITOR_RETURN(TRUE);
 		}
 #ifdef MONITOR_BREAK
 		else if (strcmp(t, "BBRK") == 0)
@@ -3869,21 +4294,28 @@ int MONITOR_Run(void)
 			if(get_hex(&addr)) CPU_regPC = addr;
 			MONITOR_break_step = TRUE;
 			PLUS_EXIT_MONITOR;
-			return TRUE;
+			MONITOR_RETURN(TRUE);
+		}
+		else if (strcmp(t, "GF") == 0) {
+			if(get_hex(&addr)) CPU_regPC = addr;
+			MONITOR_breaks_deferred = TRUE;
+			Atari800_RequestMonitorNextFrame();
+			PLUS_EXIT_MONITOR;
+			MONITOR_RETURN(TRUE);
 		}
 		else if (strcmp(t, "R") == 0 ) {
 			if(get_hex(&addr)) CPU_regPC = addr;
 			MONITOR_break_ret = TRUE;
 			MONITOR_ret_nesting = 1;
 			PLUS_EXIT_MONITOR;
-			return TRUE;
+			MONITOR_RETURN(TRUE);
 		}
 		else if (strcmp(t, "O") == 0) {
 			if(get_hex(&addr)) CPU_regPC = addr;
 			get_hex(&addr);
 			step_over();
 			PLUS_EXIT_MONITOR;
-			return TRUE;
+			MONITOR_RETURN(TRUE);
 		}
 #endif /* MONITOR_BREAK */
 #if defined(MONITOR_BREAK) || !defined(NO_YPOS_BREAK_FLICKER)
@@ -3942,13 +4374,15 @@ int MONITOR_Run(void)
 			show_CARTRIDGE();
 		else if (strcmp(t, "COLDSTART") == 0) {
 			Atari800_Coldstart();
+			MONITOR_NOTIFY_STATE_CHANGED();
 			PLUS_EXIT_MONITOR;
-			return TRUE;	/* perform reboot immediately */
+			MONITOR_RETURN(TRUE);	/* perform reboot immediately */
 		}
 		else if (strcmp(t, "WARMSTART") == 0) {
 			Atari800_Warmstart();
+			MONITOR_NOTIFY_STATE_CHANGED();
 			PLUS_EXIT_MONITOR;
-			return TRUE;	/* perform reboot immediately */
+			MONITOR_RETURN(TRUE);	/* perform reboot immediately */
 		}
 #ifndef PAGED_MEM
 		else if (strcmp(t, "READ") == 0)
@@ -4064,7 +4498,7 @@ int MONITOR_Run(void)
 			show_help();
 		else if (strcmp(t, "QUIT") == 0 || strcmp(t, "EXIT") == 0) {
 			PLUS_EXIT_MONITOR;
-			return FALSE;
+			MONITOR_RETURN(FALSE);
 		} else if(t[0] == '*' || t[0] == '@') {
 			UWORD val;
 			if(parse_hex(t, &val))
@@ -4075,6 +4509,8 @@ int MONITOR_Run(void)
 			printf("Invalid command!\n");
 	}
 }
+
+#undef MONITOR_RETURN
 
 /*
 vim:ts=4:sw=4:

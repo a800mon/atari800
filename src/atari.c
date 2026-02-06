@@ -29,12 +29,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdint.h>
 #if defined(HAVE_SIGNAL_H) && !defined(LIBATARI800)
 #define CTRL_C_HANDLER
 #include <signal.h>
 #endif
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
+#endif
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/stat.h>
 #endif
 #ifdef HAVE_WINDOWS_H
 #include <windows.h>
@@ -64,6 +73,7 @@
 #include "cartridge.h"
 #include "cassette.h"
 #include "cfg.h"
+#include "remotemonitor.h"
 #include "cpu.h"
 #include "devices.h"
 #include "esc.h"
@@ -83,6 +93,7 @@
 #include "pokey.h"
 #include "rtime.h"
 #include "pbi.h"
+#include "selfrestart.h"
 #include "sio.h"
 #include "sysrom.h"
 #include "util.h"
@@ -164,6 +175,8 @@ int Atari800_tv_mode = Atari800_TV_PAL;
 int Atari800_disable_basic = TRUE;
 
 int Atari800_os_version = -1;
+int Atari800_basic_version = -1;
+int Atari800_xegame_version = -1;
 
 int verbose = FALSE;
 
@@ -174,7 +187,11 @@ int Atari800_collisions_in_skipped_frames = FALSE;
 int Atari800_turbo = FALSE;
 int Atari800_turbo_speed = 0; /* percentage speed or 0 for max turbo */
 int Atari800_start_in_monitor = FALSE;
+int Atari800_audio_on_debug = TRUE;
 int Atari800_auto_frameskip = FALSE;
+static int atari800_reset_frame = 0;
+static int monitor_next_frame_pending = FALSE;
+static int monitor_next_frame_target = 0;
 
 #ifdef BENCHMARK
 static double benchmark_start_time;
@@ -246,6 +263,7 @@ void Atari800_Warmstart(void)
 	if (netsio_enabled)
 		netsio_warm_reset();
 #endif /* NETSIO */
+	atari800_reset_frame = Atari800_nframes;
 }
 
 void Atari800_Coldstart(void)
@@ -282,6 +300,27 @@ void Atari800_Coldstart(void)
 	if(netsio_enabled)
 		netsio_cold_reset();
 #endif /* NETSIO */
+	atari800_reset_frame = Atari800_nframes;
+}
+
+static double Atari800_GetFrameRate(void)
+{
+	return Atari800_tv_mode == Atari800_TV_PAL ? Atari800_FPS_PAL : Atari800_FPS_NTSC;
+}
+
+double Atari800_GetEmulationSeconds(void)
+{
+	double fps = Atari800_GetFrameRate();
+	return fps > 0.0 ? ((double)Atari800_nframes / fps) : 0.0;
+}
+
+double Atari800_GetEmulationSecondsSinceReset(void)
+{
+	double fps = Atari800_GetFrameRate();
+	int frames = Atari800_nframes - atari800_reset_frame;
+	if (frames < 0)
+		frames = 0;
+	return fps > 0.0 ? ((double)frames / fps) : 0.0;
 }
 
 int Atari800_LoadImage(const char *filename, UBYTE *buffer, int nbytes)
@@ -307,10 +346,14 @@ static int load_roms(void)
 {
 	int basic_ver, xegame_ver;
 	SYSROM_ChooseROMs(Atari800_machine_type, MEMORY_ram_size, Atari800_tv_mode, &Atari800_os_version, &basic_ver, &xegame_ver);
+	Atari800_basic_version = basic_ver;
+	Atari800_xegame_version = xegame_ver;
 	if (Atari800_os_version == -1
 		|| !SYSROM_LoadImage(Atari800_os_version, MEMORY_os)) {
 		/* Missing OS ROM. */
 		Atari800_os_version = -1;
+		Atari800_basic_version = -1;
+		Atari800_xegame_version = -1;
 		/* Avoid MEMORY_os containing old OS when the user explicitly removed
 		   all system ROMs from settings. */
 		memset(MEMORY_os, 0, sizeof(MEMORY_os));
@@ -319,17 +362,28 @@ static int load_roms(void)
 	else if (Atari800_machine_type != Atari800_MACHINE_5200) {
 		/* OS ROM found, try loading BASIC. */
 		MEMORY_have_basic = basic_ver != -1 && SYSROM_LoadImage(basic_ver, MEMORY_basic);
-		if (!MEMORY_have_basic)
+		if (!MEMORY_have_basic) {
 			/* Missing BASIC ROM. Don't fail when it happens. */
 			Atari800_builtin_basic = FALSE;
+			Atari800_basic_version = -1;
+		}
 
 		if (Atari800_builtin_game) {
 			/* Try loading built-in XEGS game. */
 			if (xegame_ver == -1
-				|| !SYSROM_LoadImage(xegame_ver, MEMORY_xegame))
+				|| !SYSROM_LoadImage(xegame_ver, MEMORY_xegame)) {
 				/* Missing XEGS game ROM. */
 				Atari800_builtin_game = FALSE;
+				Atari800_xegame_version = -1;
+			}
 		}
+		else {
+			Atari800_xegame_version = -1;
+		}
+	}
+	else {
+		Atari800_basic_version = -1;
+		Atari800_xegame_version = -1;
 	}
 
 	MEMORY_xe_bank = 0;
@@ -359,6 +413,49 @@ static void PreInitialise(void)
 #endif
 }
 
+void Atari800_RequestMonitorNextFrame(void)
+{
+	monitor_next_frame_target = Atari800_nframes + 1;
+	monitor_next_frame_pending = TRUE;
+}
+
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+static int monitor_break_pending = FALSE;
+static int monitor_remote_enabled_pending = FALSE;
+static int monitor_remote_enabled_active = FALSE;
+static int monitor_builtin_enabled = TRUE;
+
+void Atari800_RequestMonitor(void)
+{
+	monitor_break_pending = TRUE;
+}
+
+void Atari800_RequestMonitorRemoteEnabled(void)
+{
+	monitor_remote_enabled_pending = TRUE;
+	monitor_break_pending = TRUE;
+}
+
+void Atari800_SetBuiltinMonitor(int enabled)
+{
+	monitor_builtin_enabled = enabled ? TRUE : FALSE;
+}
+
+int Atari800_GetBuiltinMonitor(void)
+{
+	return monitor_builtin_enabled;
+}
+#endif
+
+int Atari800_IsSigintPending(void)
+{
+#ifdef CTRL_C_HANDLER
+	return sigint_flag ? TRUE : FALSE;
+#else
+	return FALSE;
+#endif
+}
+
 int Atari800_Initialise(int *argc, char *argv[])
 {
 	int i, j;
@@ -366,6 +463,9 @@ int Atari800_Initialise(int *argc, char *argv[])
 #ifndef BASIC
 	const char *state_file = NULL;
 #endif
+
+	SelfRestart_SaveProcessArgv(*argc, argv);
+
 #ifdef __PLUS
 	/* Atari800Win PLus doesn't use configuration files,
 	   it reads configuration from the Registry */
@@ -638,6 +738,79 @@ int Atari800_Initialise(int *argc, char *argv[])
 			if (strcmp(argv[i], "-run") == 0) {
 				if (i_a) run_direct = argv[++i]; else a_m = TRUE;
 			}
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+			else if (strcmp(argv[i], "-remote-monitor") == 0) {
+				RemoteMonitor_EnableDefault();
+				if (!RemoteMonitor_Enabled()) {
+					Log_print("Remote Monitor default configuration is not supported on this platform.");
+					return FALSE;
+				}
+				/* With Remote Monitor enabled, default to remote-enabled monitor mode. */
+				Atari800_SetBuiltinMonitor(FALSE);
+			}
+			else if (strcmp(argv[i], "-no-remote-monitor") == 0) {
+				RemoteMonitor_Disable();
+			}
+				else if (strcmp(argv[i], "-remote-monitor-transport") == 0) {
+					if (i_a) {
+						const char *transport = argv[++i];
+						if (!RemoteMonitor_SetTransport(transport)) {
+						Log_print("Invalid Remote Monitor transport \"%s\". Supported values: socket.", transport);
+						return FALSE;
+					}
+					if (strcmp(transport, "socket") == 0 && RemoteMonitor_GetSocketPath() == NULL) {
+						const char *default_socket_path = RemoteMonitor_DefaultSocketPath();
+						if (default_socket_path != NULL)
+							RemoteMonitor_SetSocketPath(default_socket_path);
+					}
+					RemoteMonitor_SetEnabled(TRUE);
+					if (RemoteMonitor_Enabled())
+						Atari800_SetBuiltinMonitor(FALSE);
+				}
+				else
+					a_m = TRUE;
+			}
+				else if (strcmp(argv[i], "-remote-monitor-socket-path") == 0) {
+					if (i_a) {
+						const char *socket_path = argv[++i];
+						if (strcmp(socket_path, "DEFAULT") == 0) {
+						const char *default_socket_path = RemoteMonitor_DefaultSocketPath();
+						if (default_socket_path == NULL) {
+							Log_print("The -remote-monitor-socket-path DEFAULT option is not supported for Remote Monitor on this platform.");
+							return FALSE;
+						}
+						RemoteMonitor_SetSocketPath(default_socket_path);
+					}
+					else
+						RemoteMonitor_SetSocketPath(socket_path);
+
+					if (RemoteMonitor_GetTransport() == NULL)
+						RemoteMonitor_SetTransport("socket");
+					RemoteMonitor_SetEnabled(TRUE);
+					if (RemoteMonitor_Enabled())
+						Atari800_SetBuiltinMonitor(FALSE);
+				}
+				else
+					a_m = TRUE;
+			}
+#else
+			else if (strcmp(argv[i], "-remote-monitor") == 0) {
+				Log_print("Remote Monitor is not supported on this platform.");
+			}
+			else if (strcmp(argv[i], "-no-remote-monitor") == 0) {
+				Log_print("Remote Monitor is not supported on this platform.");
+			}
+			else if (strcmp(argv[i], "-remote-monitor-transport") == 0) {
+				if (i_a)
+					++i;
+				Log_print("Remote Monitor is not supported on this platform.");
+			}
+			else if (strcmp(argv[i], "-remote-monitor-socket-path") == 0) {
+				if (i_a)
+					++i;
+				Log_print("Remote Monitor is not supported on this platform.");
+			}
+#endif
 #ifdef R_IO_DEVICE
 			else if (strcmp(argv[i], "-rdevice") == 0) {
 				Devices_enable_r_patch = TRUE;
@@ -707,6 +880,10 @@ int Atari800_Initialise(int *argc, char *argv[])
 #endif /* BASIC */
 			else if (strcmp(argv[i], "-monitor") == 0)
 				Atari800_start_in_monitor = TRUE;
+			else if (strcmp(argv[i], "-remote-monitor-audio-on-debug") == 0)
+				Atari800_audio_on_debug = TRUE;
+			else if (strcmp(argv[i], "-no-remote-monitor-audio-on-debug") == 0)
+				Atari800_audio_on_debug = FALSE;
 #ifdef MONITOR_HINTS
 			else if (strcmp(argv[i], "-label-file") == 0)
 				if (i_a) MONITOR_PreloadLabelFile(argv[++i]); else a_m = TRUE;
@@ -743,6 +920,17 @@ int Atari800_Initialise(int *argc, char *argv[])
 					Log_print("\t-pal             Enable PAL TV mode");
 					Log_print("\t-ntsc            Enable NTSC TV mode");
 					Log_print("\t-run <file>      Run Atari program (COM, EXE, XEX, BAS, LST)");
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+					Log_print("\t-remote-monitor  Enable Remote Monitor");
+					Log_print("\t-no-remote-monitor");
+					Log_print("\t                 Disable Remote Monitor");
+					Log_print("\t-remote-monitor-transport <name>");
+					Log_print("\t                 Set Remote Monitor transport (currently: socket)");
+					Log_print("\t-remote-monitor-socket-path <path>");
+					Log_print("\t                 Set UNIX socket path for Remote Monitor socket transport");
+					if (RemoteMonitor_DefaultSocketPath() != NULL)
+						Log_print("\t                 Default socket path: \"%s\"", RemoteMonitor_DefaultSocketPath());
+#endif
 #ifndef BASIC
 					Log_print("\t-state <file>    Load saved-state file");
 					Log_print("\t-refresh <rate>  Specify screen refresh rate");
@@ -767,6 +955,9 @@ int Atari800_Initialise(int *argc, char *argv[])
 #endif
 					Log_print("\t-turbo           Run emulated Atari as fast as possible");
 					Log_print("\t-monitor         Start emulated Atari in the monitor");
+					Log_print("\t-remote-monitor-audio-on-debug  Keep audio enabled while debugging (default)");
+					Log_print("\t-no-remote-monitor-audio-on-debug");
+					Log_print("\t                 Disable audio while debugging");
 #ifdef MONITOR_BREAK
 					Log_print("\t-bbrk            Break on BRK instruction");
 					Log_print("\t-bpc <addr>      Break on PC=<addr>");
@@ -996,6 +1187,9 @@ int Atari800_Initialise(int *argc, char *argv[])
 	}
 #endif /* SOUND */
 
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+#endif
+
 	return TRUE;
 }
 
@@ -1009,6 +1203,9 @@ UNALIGNED_STAT_DEF(memory_write_aligned_word_stat)
 int Atari800_Exit(int run_monitor)
 {
 	int restart;
+
+	if (run_monitor)
+		monitor_next_frame_pending = FALSE;
 
 #ifdef __PLUS
 	if (CPU_cim_encountered)
@@ -1037,7 +1234,37 @@ int Atari800_Exit(int run_monitor)
 			sums[0], sums[1], sums[2], sums[3], sums[4], sums[5]);
 	}
 #endif /* STAT_UNALIGNED_WORDS */
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (run_monitor) {
+		int remote_enabled_requested = monitor_remote_enabled_pending || monitor_remote_enabled_active;
+		if (!remote_enabled_requested && RemoteMonitor_Enabled() && !monitor_builtin_enabled &&
+		    RemoteMonitor_HasClients())
+			remote_enabled_requested = TRUE;
+		if (remote_enabled_requested) {
+			if (!MONITOR_EnableRemoteEnabledIO()) {
+				monitor_remote_enabled_pending = FALSE;
+				return TRUE;
+			}
+			monitor_remote_enabled_active = TRUE;
+		}
+	}
+#endif
 	restart = PLATFORM_Exit(run_monitor);
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (monitor_remote_enabled_active) {
+		int keep_remote_enabled = 0;
+#ifdef MONITOR_BREAK
+		if (MONITOR_break_step)
+			keep_remote_enabled = 1;
+#endif
+		if (!keep_remote_enabled) {
+			MONITOR_DisableRemoteEnabledIO();
+			monitor_remote_enabled_active = FALSE;
+		}
+	}
+	if (!monitor_remote_enabled_active)
+		monitor_remote_enabled_pending = FALSE;
+#endif
 #ifdef CTRL_C_HANDLER
 	/* If a user pressed Ctrl+C in the monitor, avoid immediate return to it. */
 	sigint_flag = FALSE;
@@ -1087,6 +1314,9 @@ int Atari800_Exit(int run_monitor)
 		File_Export_StopRecording();
 #endif
 		MONITOR_Exit();
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+		RemoteMonitor_CloseAll();
+#endif
 #ifdef SDL
 		SDL_INIT_Exit();
 #endif /* SDL */
@@ -1157,7 +1387,24 @@ void Atari800_Sync(void)
 	curtime = Util_time();
 	if (Atari800_auto_frameskip)
 		autoframeskip(curtime, lasttime);
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (RemoteMonitor_Enabled() && lasttime > curtime) {
+		double endtime = lasttime;
+		double remaining = endtime - curtime;
+		const double slice = 0.002;
+		while (remaining > 0.0) {
+			double step = remaining > slice ? slice : remaining;
+			Util_sleep(step);
+			RemoteMonitor_Poll();
+			curtime = Util_time();
+			remaining = endtime - curtime;
+		}
+	}
+	else
+#endif
+	{
 	Util_sleep(lasttime - curtime);
+	}
 	curtime = Util_time();
 
 	if ((lasttime + deltatime) < curtime)
@@ -1321,13 +1568,33 @@ void Atari800_Frame(void)
 #ifndef BASIC
 	static int refresh_counter = 0;
 
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	RemoteMonitor_Poll();
+#endif
+
 #ifdef CTRL_C_HANDLER
 	if (sigint_flag) {
 		sigint_flag = FALSE;
+		/* In remote-monitor remote-enabled mode Ctrl+C should terminate emulator,
+		   not enter a monitor with no interactive stdin. */
+		if (RemoteMonitor_Enabled() && !Atari800_GetBuiltinMonitor() &&
+		    RemoteMonitor_HasClients())
+			INPUT_key_code = AKEY_EXIT;
+		else {
+			INPUT_key_code = AKEY_UI;
+			UI_alt_function = UI_MENU_MONITOR;
+		}
+	}
+#endif /* CTRL_C_HANDLER */
+
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (monitor_break_pending) {
+		monitor_break_pending = FALSE;
 		INPUT_key_code = AKEY_UI;
 		UI_alt_function = UI_MENU_MONITOR;
 	}
-#endif /* CTRL_C_HANDLER */
+#endif
+
 
 	switch (INPUT_key_code) {
 	case AKEY_COLDSTART:
@@ -1348,6 +1615,13 @@ void Atari800_Frame(void)
 #endif
 		UI_Run();
 #ifdef SOUND
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H) && defined(MONITOR_BREAK)
+		if (RemoteMonitor_Enabled() && !Atari800_GetBuiltinMonitor() &&
+		    RemoteMonitor_HasClients() &&
+		    !Atari800_audio_on_debug &&
+		    (MONITOR_break_step || MONITOR_break_ret))
+			break;
+#endif
 		Sound_Continue();
 #endif
 		break;
@@ -1426,6 +1700,10 @@ void Atari800_Frame(void)
 	Screen_DrawMultimediaStats();
 #endif
 	Atari800_nframes++;
+	if (monitor_next_frame_pending && Atari800_nframes >= monitor_next_frame_target) {
+		monitor_next_frame_pending = FALSE;
+		Atari800_RequestMonitor();
+	}
 #ifndef LIBATARI800
 #ifdef BENCHMARK
 	if (Atari800_nframes >= BENCHMARK) {
@@ -1603,3 +1881,26 @@ void Atari800_SetTVMode(int mode)
 #endif /* SOUND */
 	}
 }
+
+#if !defined(HAVE_UNISTD_H) || defined(HAVE_WINDOWS_H)
+void Atari800_RequestMonitor(void)
+{
+	INPUT_key_code = AKEY_UI;
+	UI_alt_function = UI_MENU_MONITOR;
+}
+
+void Atari800_RequestMonitorRemoteEnabled(void)
+{
+	Atari800_RequestMonitor();
+}
+
+void Atari800_SetBuiltinMonitor(int enabled)
+{
+	(void)enabled;
+}
+
+int Atari800_GetBuiltinMonitor(void)
+{
+	return TRUE;
+}
+#endif

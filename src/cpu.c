@@ -103,6 +103,7 @@ unsigned int CPU_remember_jmp_curpos = 0;
 
 UBYTE CPU_cim_encountered = FALSE;
 UBYTE CPU_IRQ;
+int CPU_freeze = FALSE;
 UBYTE CPU_delayed_nmi;
 
 /* Windows headers define it */
@@ -370,6 +371,8 @@ void CPU_NMI(void)
 	UBYTE data;
 #endif
 
+	if (CPU_freeze)
+		return;
 	if(CPU_delayed_nmi > 0)
 		CPU_GO(ANTIC_xpos_limit + CPU_delayed_nmi);
 
@@ -610,6 +613,11 @@ void CPU_GO(int limit)
 		ANTIC_wsync_halt = 0;
 	}
 	ANTIC_xpos_limit = limit;			/* needed for WSYNC store inside ANTIC */
+	if (CPU_freeze) {
+		if (ANTIC_xpos < ANTIC_xpos_limit)
+			ANTIC_xpos = ANTIC_xpos_limit;
+		return;
+	}
 
 	UPDATE_LOCAL_REGS;
 
@@ -672,7 +680,8 @@ void CPU_GO(int limit)
 			CPU_remember_xpos[CPU_remember_PC_curpos] = ANTIC_xpos + (ANTIC_ypos << 8);
 		CPU_remember_PC_curpos = (CPU_remember_PC_curpos + 1) % CPU_REMEMBER_PC_STEPS;
 
-		if (MONITOR_break_addr == GET_PC() || ANTIC_break_ypos == ANTIC_ypos) {
+			if (!MONITOR_BreaksDeferred() &&
+			    (MONITOR_break_addr == GET_PC() || ANTIC_break_ypos == ANTIC_ypos)) {
 			DO_BREAK;
 		}
 #endif /* MONITOR_BREAK */
@@ -685,9 +694,13 @@ void CPU_GO(int limit)
 
 #ifdef MONITOR_BREAKPOINTS
 #ifdef MONITOR_BREAK
-		if (MONITOR_breakpoint_table_size > 0 && MONITOR_breakpoints_enabled && !MONITOR_break_step)
+			if (!MONITOR_BreaksDeferred() &&
+			    MONITOR_breakpoint_table_size > 0 &&
+			    MONITOR_breakpoints_enabled && !MONITOR_break_step)
 #else
-		if (MONITOR_breakpoint_table_size > 0 && MONITOR_breakpoints_enabled)
+			if (!MONITOR_BreaksDeferred() &&
+			    MONITOR_breakpoint_table_size > 0 &&
+			    MONITOR_breakpoints_enabled)
 #endif
 		{
 			UBYTE optype = MONITOR_optype6502[insn];
@@ -2436,7 +2449,7 @@ void CPU_GO(int limit)
 #endif
 
 #ifdef MONITOR_BREAK
-		if (MONITOR_break_step) {
+		if (!MONITOR_BreaksDeferred() && MONITOR_break_step) {
 			DO_BREAK;
 		}
 #endif

@@ -41,6 +41,7 @@
 
 #include "antic.h"
 #include "atari.h"
+#include "remotemonitor.h"
 #include "input.h"
 #include "akey.h"
 #include "log.h"
@@ -91,6 +92,9 @@ static int GetKeyPress(void)
 
 	for (;;) {  
 		static int rep = KB_DELAY;
+		RemoteMonitor_Poll();
+		if (UI_alt_function >= 0)
+			return 0x1b; /* escape - go to Main Menu */
 		if (PLATFORM_Keyboard() == AKEY_NONE) {
 			rep = KB_DELAY;
 			break;
@@ -106,6 +110,9 @@ static int GetKeyPress(void)
 
 	do { 
 		Atari800_Sync();
+		RemoteMonitor_Poll();
+		if (UI_alt_function >= 0)
+			return 0x1b; /* escape */
 		keycode = PLATFORM_Keyboard();
 		switch (keycode) {
 		case AKEY_WARMSTART:

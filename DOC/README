@@ -154,3 +154,5 @@ o Recording input events to a file and playing them back
 o MIO and Black Box emulation
 
 o 1400XL and 1450XLD emulation
+
+o Remote Monitor / Debugger support using binary protocol

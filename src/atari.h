@@ -97,6 +97,10 @@ extern int Atari800_disable_basic;
 /* OS ROM version currently used by the emulator. Can be -1 for missing ROM, or
    a value from the SYSROM enumerator. */
 extern int Atari800_os_version;
+/* BASIC ROM version currently used by the emulator. Can be -1 for missing ROM. */
+extern int Atari800_basic_version;
+/* XEGS builtin game ROM version currently used by the emulator. Can be -1 for missing ROM. */
+extern int Atari800_xegame_version;
 
 /* If Atari800_Frame() sets it to TRUE, then the current contents
    of Screen_atari should be displayed. */
@@ -123,6 +127,8 @@ extern int Atari800_turbo_speed;
 /* Set to TRUE to start in the monitor. It's up to each port's
 	main.c to implement this (initially only SDL supports it). */
 extern int Atari800_start_in_monitor;
+/* Set to TRUE to keep audio enabled while debugging in monitor mode. */
+extern int Atari800_audio_on_debug;
 
 /* Initializes Atari800 emulation core. */
 int Atari800_Initialise(int *argc, char *argv[]);
@@ -135,6 +141,20 @@ void Atari800_Coldstart(void);
 
 /* Presses the Reset key in the emulated Atari. */
 void Atari800_Warmstart(void);
+void Atari800_RequestMonitor(void);
+void Atari800_RequestMonitorNextFrame(void);
+void Atari800_RequestMonitorRemoteEnabled(void);
+void Atari800_SetBuiltinMonitor(int enabled);
+int Atari800_GetBuiltinMonitor(void);
+int Atari800_IsSigintPending(void);
+
+/* Emulation time helpers (seconds based on emulated frames). */
+double Atari800_GetEmulationSeconds(void);
+double Atari800_GetEmulationSecondsSinceReset(void);
+
+/* Process restart helpers (POSIX builds). */
+int Atari800_CanRestartProcess(void);
+int Atari800_RestartProcess(void);
 
 /* Reinitializes after Atari800_machine_type or ram_size change.
    You should call Atari800_Coldstart() after it. */

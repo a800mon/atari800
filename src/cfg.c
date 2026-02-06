@@ -35,6 +35,7 @@
 #include "memory.h"
 #include "pbi.h"
 #include "rtime.h"
+#include "remotemonitor.h"
 #include "sysrom.h"
 #ifdef XEP80_EMULATION
 #include "xep80.h"
@@ -212,6 +213,63 @@ int CFG_LoadConfig(const char *alternate_config_filename)
 			else if (strcmp(string, "ENABLE_R_PATCH") == 0) {
 				Devices_enable_r_patch = Util_sscanbool(ptr);
 			}
+			else if (strcmp(string, "REMOTE_MONITOR") == 0) {
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+				if (Util_sscanbool(ptr)) {
+					RemoteMonitor_SetEnabled(TRUE);
+					if (RemoteMonitor_GetTransport() == NULL ||
+					    RemoteMonitor_GetSocketPath() == NULL) {
+						RemoteMonitor_EnableDefault();
+					}
+					if (!RemoteMonitor_Enabled()) {
+						Log_print("Remote Monitor default configuration is not supported on this platform.");
+					}
+					else {
+						Atari800_SetBuiltinMonitor(FALSE);
+					}
+				}
+				else {
+					RemoteMonitor_Disable();
+				}
+#else
+				if (Util_sscanbool(ptr))
+					Log_print("Remote Monitor is not supported on this platform.");
+#endif
+			}
+			else if (strcmp(string, "REMOTE_MONITOR_AUDIO_ON_DEBUG") == 0) {
+				Atari800_audio_on_debug = Util_sscanbool(ptr);
+			}
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+			else if (strcmp(string, "REMOTE_MONITOR_TRANSPORT") == 0) {
+				if (!RemoteMonitor_SetTransport(ptr)) {
+					Log_print("Invalid Remote Monitor transport: %s", ptr);
+				}
+				else if (strcmp(ptr, "socket") == 0 && RemoteMonitor_GetSocketPath() == NULL) {
+					const char *default_socket_path = RemoteMonitor_DefaultSocketPath();
+					if (default_socket_path != NULL)
+						RemoteMonitor_SetSocketPath(default_socket_path);
+				}
+				if (RemoteMonitor_Enabled())
+					Atari800_SetBuiltinMonitor(FALSE);
+			}
+			else if (strcmp(string, "REMOTE_MONITOR_SOCKET_PATH") == 0) {
+				if (ptr[0] == '\0')
+					RemoteMonitor_SetSocketPath(NULL);
+				else if (strcmp(ptr, "DEFAULT") == 0) {
+					const char *default_socket_path = RemoteMonitor_DefaultSocketPath();
+					if (default_socket_path == NULL)
+						Log_print("REMOTE_MONITOR_SOCKET_PATH=DEFAULT is not supported on this platform.");
+					else
+						RemoteMonitor_SetSocketPath(default_socket_path);
+				}
+				else
+					RemoteMonitor_SetSocketPath(ptr);
+				if (RemoteMonitor_GetTransport() == NULL)
+					RemoteMonitor_SetTransport("socket");
+				if (RemoteMonitor_Enabled())
+					Atari800_SetBuiltinMonitor(FALSE);
+			}
+#endif
 
 			else if (strcmp(string, "ENABLE_NEW_POKEY") == 0) {
 #ifdef SOUND
@@ -433,6 +491,16 @@ int CFG_WriteConfig(void)
 	fprintf(fp, "ENABLE_P_PATCH=%d\n", Devices_enable_p_patch);
 #ifdef R_IO_DEVICE
 	fprintf(fp, "ENABLE_R_PATCH=%d\n", Devices_enable_r_patch);
+#endif
+	fprintf(fp, "REMOTE_MONITOR=%d\n", RemoteMonitor_Enabled() ? 1 : 0);
+	fprintf(fp, "REMOTE_MONITOR_AUDIO_ON_DEBUG=%d\n", Atari800_audio_on_debug);
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	{
+		const char *transport = RemoteMonitor_GetTransport();
+		const char *socket_path = RemoteMonitor_GetSocketPath();
+		fprintf(fp, "REMOTE_MONITOR_TRANSPORT=%s\n", transport != NULL ? transport : "");
+		fprintf(fp, "REMOTE_MONITOR_SOCKET_PATH=%s\n", socket_path != NULL ? socket_path : "");
+	}
 #endif
 
 #ifdef SOUND

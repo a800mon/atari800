@@ -72,6 +72,7 @@ extern UBYTE CPU_regX;
 #define CPU_ClrC CPU_regP &= (~CPU_C_FLAG)
 
 extern UBYTE CPU_IRQ;
+extern int CPU_freeze;
 
 extern void (*CPU_rts_handler)(void);
 
