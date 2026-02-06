@@ -569,6 +569,26 @@ Disable automatic reboot after cartridge inserting/removing.
 .BI \-run\  filename
 Run Atari program (EXE, COM, XEX, BAS, LST)
 .TP
+.B \-remote\-monitor
+Enable Remote Monitor using default transport settings.
+.TP
+.B \-no\-remote\-monitor
+Disable Remote Monitor.
+.TP
+.BI \-remote\-monitor\-transport\  name
+Select Remote Monitor transport.
+Currently supported value: \fBsocket\fR.
+.TP
+.BI \-remote\-monitor\-socket\-path\  path
+Set UNIX socket path for Remote Monitor socket transport.
+On Linux, default socket path is \fB/tmp/atari.sock\fR.
+.TP
+.B \-remote\-monitor\-audio\-on\-debug
+Keep audio enabled while debugging (default).
+.TP
+.B \-no\-remote\-monitor\-audio\-on\-debug
+Disable audio while debugging.
+.TP
 .BI \-state\  filename
 Load saved-state file
 .TP

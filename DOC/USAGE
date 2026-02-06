@@ -157,6 +157,17 @@ Command line options
 -no-cart-autoreboot   Don't reboot after cartridge inserting/removing
 
 -run <filename>       Run Atari program (EXE, COM, XEX, BAS, LST)
+-remote-monitor      Enable Remote Monitor using default transport settings
+-no-remote-monitor   Disable Remote Monitor
+-remote-monitor-transport <name>
+                     Select Remote Monitor transport (currently: socket)
+-remote-monitor-socket-path <path>
+                     Set UNIX socket path for Remote Monitor socket transport
+                     (on Linux, default socket path is /tmp/atari.sock)
+-remote-monitor-audio-on-debug
+                     Keep audio enabled while debugging (default)
+-no-remote-monitor-audio-on-debug
+                     Disable audio while debugging
 
 -state <filename>     Load saved-state file
 
@@ -622,4 +633,3 @@ Alt        Atari/Inverse key (either Alt key will work)
 Joystick 0 is operated by the mouse position relative to the center of the
 screen. The mouse button acts as the trigger. On Linux, standard joysticks
 are also supported.
-

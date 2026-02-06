@@ -1,3 +1,19 @@
+Next version (2026/??/??)
+=========================
+
+ New features:
+ -------------
+  * Added Remote Monitor runtime integration (enable with `-remote-monitor`).
+  * Remote Monitor provides live emulation preview during remote debugging sessions.
+
+ Limitations:
+ ------------
+  * Remote Monitor is currently available on Unix-like platforms
+    (Linux, macOS, BSD).
+  * Remote Monitor socket transport does not replace existing socket paths
+    automatically; remove stale files manually or choose another path.
+
+
 Version 5.3.0 (2024/xx/xx)
 ==========================
 
@@ -180,7 +196,7 @@ Version 4.2.0 (2019/12/28) - released at SILK
   * optional hiding of hidden files/folders in the UI file selector
   * libatari800 (Atari800 as a library) by Rob McMullen
   * R: device (many years old feature) enabled by default
- 
+
  Fixes:
  ------
   * proper check if SDL joysticks are found (fixes #58)
@@ -333,10 +349,10 @@ Version 4.0.0 (2018/04/21) - release cooked at Atariada.cz
   * Many small fixes and optimisations
 
  == Android ==
-  * Built-in Planetary Defense 2012 by Tom Hudson, an enhanced version of 
+  * Built-in Planetary Defense 2012 by Tom Hudson, an enhanced version of
     the classic game with emulated touchscreen controls.
-  * New feature: Native sound playback for post 2.3 devices, automatically 
-    enabled. Eliminates stuttering and inconsistent timing of previous 
+  * New feature: Native sound playback for post 2.3 devices, automatically
+    enabled. Eliminates stuttering and inconsistent timing of previous
     implementation.
 
 
@@ -382,7 +398,7 @@ Version 3.1.0 (2014/04/12) - release cooked at Atariada.cz
  General Fixes:
  --------------
   * fixed possible unnecessary cartridge bank switching
-  * fixes and clean up in Java port 
+  * fixes and clean up in Java port
   * fixed diagnostic cartridge cold start (doesn't send Start+Option)
   * fixed two old bugs in DOS sound (pitch being wrong and sound missing)
   * fixed keyboard not working for ncurses video and OSS sound
@@ -555,39 +571,39 @@ Version 2.2.0 (2011/04/02)
 
   SDL Display enhancements:
   -------------------------
-1. Fullscreen resolution - this gives a list of all available resolutions from 
-which a user chooses one. The default resolution is the next-bigger-than 
+1. Fullscreen resolution - this gives a list of all available resolutions from
+which a user chooses one. The default resolution is the next-bigger-than
 336x240.
 
-2. Fullscreen: yes/no - obvious. Window size is independent from the chosen 
+2. Fullscreen: yes/no - obvious. Window size is independent from the chosen
 fullscreen resolution and can be changed by resizing the window.
 
-3. Rotate sideways: yes/no - rotates the screen by 90 deg. Works as earlier, 
+3. Rotate sideways: yes/no - rotates the screen by 90 deg. Works as earlier,
 ie. only for "standard" display (no NTSC filter, no 80 column card).
 
-4. Stretch - this option controls how display stretching (scaling) is 
+4. Stretch - this option controls how display stretching (scaling) is
 performed. We can select one of:
 a) none - no stretching at all
-b) integer multiples (default) - width and height will be resized by 1x, 2x, 
+b) integer multiples (default) - width and height will be resized by 1x, 2x,
 3x etc.
 c) full - stretching is unrestricted, display will cover the entire screen.
 
-5. Keep aspect ratio - this option controls how the display's aspect ratio is 
+5. Keep aspect ratio - this option controls how the display's aspect ratio is
 corrected. 3 options available:
-a) disabled - no aspect ratio correction, display will fill entire 
+a) disabled - no aspect ratio correction, display will fill entire
 screen/window,
 b) 1:1 (default) - width and height will be multipled by the same value
-c) like real TV - display will be resized to reflect pixel aspect ratio of a 
+c) like real TV - display will be resized to reflect pixel aspect ratio of a
 real Atari connected to a TV. Atari pixels are not square; pixel width-to-
-height ratio is about 0.857 for NTSC and 1.039 for PAL. This option reflects 
+height ratio is about 0.857 for NTSC and 1.039 for PAL. This option reflects
 that.
 
-6. Host display aspect ratio - here the user enters aspect ratio of his 
-monitor. This value is used to properly compute display aspect ratio when 
-"Keep aspect ratio" is set to "like real TV". Set it to 4:3 (default), 16:9, 
+6. Host display aspect ratio - here the user enters aspect ratio of his
+monitor. This value is used to properly compute display aspect ratio when
+"Keep aspect ratio" is set to "like real TV". Set it to 4:3 (default), 16:9,
 1.78:1 etc.
 
-7. Horizontal view area - this option sets the size of Atari screen area 
+7. Horizontal view area - this option sets the size of Atari screen area
 visible horizontally. Choose one of:
 a) narrow - 320 columns wide,
 b) normal (default) - 336 columns wide,
@@ -596,29 +612,29 @@ d) custom - lets the user enter any value between 160 and 384.
 
 8. Vertical view area - similar to above:
 a) short - 200 lines high
-b) normal (default) - this setting is TV-system-dependent. In PAL this makes 
-all 240 lines visible, while in NTSC top and bottom 8 lines are hidden, which 
-leaves 224 lines visible. I've made this as such because apparently on NTSC 
-TVs not all 240 lines are visible. The value of 224 was taken by taking full 
-NTSC height (480, divided by 2) and cutting top and bottom 3.5% (different 
+b) normal (default) - this setting is TV-system-dependent. In PAL this makes
+all 240 lines visible, while in NTSC top and bottom 8 lines are hidden, which
+leaves 224 lines visible. I've made this as such because apparently on NTSC
+TVs not all 240 lines are visible. The value of 224 was taken by taking full
+NTSC height (480, divided by 2) and cutting top and bottom 3.5% (different
 sources say 3.5% is the "action-safe" overscan area).
 c) full - 240 lines high
 d) custom - any value between 100 and 240.
 
-9. Horizontal offset - when amount of columns displayed is less than 384, this 
-option "shifts" the visible screen area. Setting to higher than 0 shows more 
+9. Horizontal offset - when amount of columns displayed is less than 384, this
+option "shifts" the visible screen area. Setting to higher than 0 shows more
 of the right side, and lower than 0 shows more of the left side.
 
 10. Vertical offset - similar to above.
 
-Additionally, the Alt+Shift+X shortcut that switches beetween standard<->80 
-column display is now also available as "Display settings->80 column display 
+Additionally, the Alt+Shift+X shortcut that switches beetween standard<->80
+column display is now also available as "Display settings->80 column display
 if available: yes/no".
 
-The Alt+B switch however has been removed - since setting black/white colours 
+The Alt+B switch however has been removed - since setting black/white colours
 can be done in Display settings anyway.
 
-All new options are also available from command line and are saveable in 
+All new options are also available from command line and are saveable in
 configuration.
 
   New Android port features:
@@ -626,7 +642,7 @@ configuration.
 - Efficient performance
 - Uses Opengl ES to handle scaling of the graphics
 - Runs on Android 1.6+
-- Novel on screen touch joystick control for less hand cramps & intuitive 
+- Novel on screen touch joystick control for less hand cramps & intuitive
   control
 - Supports multi touch input
 - Supports hardware keyboard with key remapping for joystick input
@@ -716,13 +732,13 @@ Version 2.0.3 (2007/07/11)
 
 Version 2.0.2 (2006/04/08)
 
- There is a new NTSC emulator available thanks to Blargg (Shay Green) 
+ There is a new NTSC emulator available thanks to Blargg (Shay Green)
  (http://www.slack.net/~ant) and NewRisingSun who made the original algorithm.
- You can access it with -ntscemu in the SDL port only.  
+ You can access it with -ntscemu in the SDL port only.
  Only 640x480x16 is supported and will be invoked automatically.
  You will need a fast processor (~700 MHz or so).
  This code should be considered experimental but I hope you
- will try it and report any problems.  Please experiment with the 
+ will try it and report any problems.  Please experiment with the
  many settings and compare them with a real NTSC Atari if you have one.
  If you come up with better settings than the current defaults please provide
  feedback. Try -ntsc_burst 0.70 in Drol, Choplifter and Ultima.
