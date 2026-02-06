@@ -103,6 +103,7 @@ unsigned int CPU_remember_jmp_curpos = 0;
 
 UBYTE CPU_cim_encountered = FALSE;
 UBYTE CPU_IRQ;
+int CPU_freeze = FALSE;
 UBYTE CPU_delayed_nmi;
 
 /* Windows headers define it */
@@ -370,6 +371,8 @@ void CPU_NMI(void)
 	UBYTE data;
 #endif
 
+	if (CPU_freeze)
+		return;
 	if(CPU_delayed_nmi > 0)
 		CPU_GO(ANTIC_xpos_limit + CPU_delayed_nmi);
 
@@ -610,6 +613,11 @@ void CPU_GO(int limit)
 		ANTIC_wsync_halt = 0;
 	}
 	ANTIC_xpos_limit = limit;			/* needed for WSYNC store inside ANTIC */
+	if (CPU_freeze) {
+		if (ANTIC_xpos < ANTIC_xpos_limit)
+			ANTIC_xpos = ANTIC_xpos_limit;
+		return;
+	}
 
 	UPDATE_LOCAL_REGS;
 

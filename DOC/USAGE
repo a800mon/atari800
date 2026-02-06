@@ -157,6 +157,9 @@ Command line options
 -no-cart-autoreboot   Don't reboot after cartridge inserting/removing
 
 -run <filename>       Run Atari program (EXE, COM, XEX, BAS, LST)
+-socket <path>       Read binary commands from a UNIX socket
+-live-monitor         Refresh video while monitor is active
+-live-monitor-audio   Refresh audio while monitor is active
 
 -state <filename>     Load saved-state file
 
@@ -622,4 +625,3 @@ Alt        Atari/Inverse key (either Alt key will work)
 Joystick 0 is operated by the mouse position relative to the center of the
 screen. The mouse button acts as the trigger. On Linux, standard joysticks
 are also supported.
-
