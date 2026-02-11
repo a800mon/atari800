@@ -1,11 +1,15 @@
-# Atari800 Socket RPC Protocol (Binary)
+# Atari800 Remote Monitor Binary Protocol (RPC)
 
-This document describes the UNIX socket binary RPC protocol implemented in `src/socketserver.c`.
+This document describes the Remote Monitor binary RPC protocol implemented in `src/remotemonitor.c`.
 
 ## Transport
 
 - Transport: UNIX domain stream socket (`AF_UNIX`, `SOCK_STREAM`)
-- Enable in emulator: `-socket <path>`
+- Enable in emulator:
+  - `-remote-monitor`
+  - `-remote-monitor-transport socket`
+  - `-remote-monitor-socket-path <path>` (optional; on Linux default is `/tmp/atari.sock`)
+  - config: `REMOTE_MONITOR_TRANSPORT=socket`, `REMOTE_MONITOR_SOCKET_PATH=<path>`
 - Multiple clients supported: up to 8
 - Model: request/response (no unsolicited server messages)
 
@@ -33,7 +37,7 @@ All multi-byte integers are little-endian.
 
 ## Limits and Behavior
 
-- Max payload/data bytes: `4096` (`SOCKET_SERVER_MAX_PAYLOAD`)
+- Max payload/data bytes: `4096` (`REMOTE_MONITOR_MAX_PAYLOAD`)
 - If declared frame size exceeds internal input buffer, server closes client connection
 - Queued `STATUS` requests are coalesced: only newest pending `STATUS` is handled
 - Server send path is non-blocking; send failure closes client connection
@@ -285,6 +289,17 @@ Response `OK` data:
 | Field | Size | Description |
 | --- | --- | --- |
 | (none) | `0` | Empty. |
+
+Command-specific error codes:
+
+| Code | Name | Condition |
+| --- | --- | --- |
+| `2` | `INVALID_LENGTH` | Payload length is outside `1..FILENAME_MAX-1`. |
+| `3` | `INVALID_VALUE` | Path becomes empty after trimming/unquoting. |
+| `5` | `FILE_NOT_FOUND` | Target path does not exist. |
+| `6` | `FILE_OPEN_FAILED` | File exists but cannot be opened/stat'ed. |
+| `7` | `FILE_RUN_FAILED` | Runnable file detected but execution failed. |
+| `8` | `UNSUPPORTED_FILE` | File exists but type is unsupported. |
 
 ---
 
@@ -596,7 +611,11 @@ Note: this binary API covers comparison conditions (`PC/A/X/Y/S/READ/WRITE/ACCES
 
 ---
 
-### `27` `CONFIG`
+### `27` `BUILD_FEATURES`
+
+Wire compatibility note:
+- This command uses id `27` and keeps the same payload/response format as before.
+- Older code may refer to this command as `CONFIG`.
 
 Request payload:
 
@@ -608,15 +627,15 @@ Response `OK` data header:
 
 | Field | Size | Description |
 | --- | --- | --- |
-| `count` | `u16` | Number of capability ids that follow. |
+| `count` | `u16` | Number of build-feature ids that follow. |
 
-Response `OK` capability item (repeated `count` times):
+Response `OK` build-feature item (repeated `count` times):
 
 | Field | Size | Description |
 | --- | --- | --- |
-| `cap_id` | `u16` | Capability id present in current binary build. |
+| `cap_id` | `u16` | Build-feature id present in current binary build. |
 
-Capability constants:
+Build-feature constants:
 
 | `cap_id` | Const name | Meaning |
 | --- | --- | --- |
@@ -671,14 +690,14 @@ Response `OK` data:
 
 Effect:
 - Restarts the emulator process using the original startup command line (`execvp(argv[0], argv)`).
-- Available in current POSIX socket-server builds.
+- Available in current POSIX Remote Monitor builds.
 - If restart setup is unavailable, command returns non-zero status with error text.
 
 ## `state_seq` Semantics
 
 `state_seq` is a monotonic `u32` included in `STATUS`.
 
-It increments when emulator state is changed by socket commands and builtin monitor operations (for example memory writes, media changes, resets). Clients can poll `STATUS` and refresh when `state_seq` changes.
+It increments when emulator state is changed by Remote Monitor commands and builtin monitor operations (for example memory writes, media changes, resets). Clients can poll `STATUS` and refresh when `state_seq` changes.
 
 ## Python Examples
 
@@ -705,10 +724,10 @@ paused = bool(flags & 0x01)
 crashed = bool(flags & 0x80)
 ```
 
-### `CONFIG`
+### `BUILD_FEATURES`
 
 ```python
-status, data = rpc.call(Command.CONFIG, b"")
+status, data = rpc.call(Command.BUILD_FEATURES, b"")
 count = struct.unpack_from("<H", data, 0)[0]
 caps = [struct.unpack_from("<H", data, 2 + i * 2)[0] for i in range(count)]
 ```

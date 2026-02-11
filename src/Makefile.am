@@ -61,7 +61,7 @@ atari800_SOURCES = \
 	afile.c afile.h \
 	antic.c antic.h \
 	atari.c atari.h \
-	socketserver.c socketserver.h \
+	remotemonitor.c remotemonitor.h \
 	binload.c binload.h \
 	cartridge.c cartridge.h \
 	cartridge_info.c cartridge_info.h \

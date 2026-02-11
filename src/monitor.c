@@ -58,8 +58,8 @@
 #include "pokey.h"
 #include "util.h"
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
-#include "socketserver.h"
-#define MONITOR_NOTIFY_STATE_CHANGED() SocketServer_NotifyStateChanged()
+#include "remotemonitor.h"
+#define MONITOR_NOTIFY_STATE_CHANGED() RemoteMonitor_NotifyStateChanged()
 #else
 #define MONITOR_NOTIFY_STATE_CHANGED() do { } while (0)
 #endif
@@ -426,8 +426,8 @@ static void monitor_run_frame(int do_video, int do_audio)
 
 static void monitor_live_refresh(void)
 {
-	int do_video = Atari800_live_monitor;
-	int do_audio = Atari800_live_monitor_audio;
+	int do_video = monitor_headless_enabled && RemoteMonitor_HasClients();
+	int do_audio = do_video && Atari800_audio_on_debug;
 	static double last_refresh_time = 0.0;
 	double now;
 	double frame_time;
@@ -1228,7 +1228,7 @@ static void safe_gets(char *buffer, size_t size, char const *prompt)
 			}
 			else {
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
-				if (SocketServer_Enabled()) {
+				if (RemoteMonitor_Enabled()) {
 					for (;;) {
 						struct pollfd pfd;
 						int pr;
@@ -1246,8 +1246,8 @@ static void safe_gets(char *buffer, size_t size, char const *prompt)
 							break;
 						}
 						if (pr == 0) {
-							SocketServer_Poll();
-							if (monitor_headless_enabled && !SocketServer_HasClients()) {
+							RemoteMonitor_Poll();
+							if (monitor_headless_enabled && !RemoteMonitor_HasClients()) {
 								monitor_input_empty = 1;
 								monitor_input_eof = 1;
 								buffer[0] = '\0';
@@ -1353,7 +1353,7 @@ static void safe_gets(char *buffer, size_t size, char const *prompt)
 	}
 
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
-	if (SocketServer_Enabled()) {
+	if (RemoteMonitor_Enabled()) {
 		int fd = fileno(monitor_in());
 		unsigned char ch;
 		size_t pos = 0;
@@ -1370,7 +1370,7 @@ static void safe_gets(char *buffer, size_t size, char const *prompt)
 			pfd.events = POLLIN;
 			pr = poll(&pfd, 1, MONITOR_POLL_MS);
 			if (pr == 0) {
-				SocketServer_Poll();
+				RemoteMonitor_Poll();
 				if (!monitor_pause_live_refresh)
 					monitor_live_refresh();
 				if (monitor_take_pending_action(prompt, buffer, size))
@@ -4538,7 +4538,7 @@ int MONITOR_Run(void)
 #endif
 
 #ifdef SOUND
-	if (Atari800_live_monitor_audio) {
+	if (monitor_headless_enabled && RemoteMonitor_HasClients() && Atari800_audio_on_debug) {
 		Sound_Continue();
 		live_audio_started = 1;
 	}
@@ -4571,7 +4571,7 @@ int MONITOR_Run(void)
 
 	show_state();
 	if (monitor_gf_pending) {
-		monitor_run_frame(TRUE, Atari800_live_monitor_audio);
+		monitor_run_frame(TRUE, monitor_headless_enabled && RemoteMonitor_HasClients() && Atari800_audio_on_debug);
 		monitor_gf_pending = 0;
 		pause_live_refresh = 1;
 		monitor_pause_live_refresh = 1;
@@ -4589,14 +4589,19 @@ int MONITOR_Run(void)
 		if (monitor_take_pending_action("> ", s, sizeof(s))) {
 			/* already filled */
 		}
-		else {
-			safe_gets(s, sizeof(s), "> ");
-			if (monitor_external_io && monitor_input_empty) {
-				if (monitor_input_eof)
-					MONITOR_RETURN(TRUE);
-				continue;
+			else {
+				safe_gets(s, sizeof(s), "> ");
+				if (monitor_external_io && monitor_input_empty) {
+					if (monitor_input_eof) {
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+						if (monitor_headless_enabled && Atari800_IsSigintPending())
+							MONITOR_RETURN(FALSE);
+#endif
+						MONITOR_RETURN(TRUE);
+					}
+					continue;
+				}
 			}
-		}
 		if (s[0] != '\0') {
 			strcpy(old_s, s);
 		}
@@ -4722,15 +4727,15 @@ int MONITOR_Run(void)
 		else if (strcmp(t, "COV") == 0)
 			coverage();
 #endif /* MONITOR_PROFILE */
-		else if (strcmp(t, "SHOW") == 0)
-			show_state();
-		else if (strcmp(t, "SYNC") == 0)
-			monitor_force_refresh(TRUE, Atari800_live_monitor_audio);
-		else if (strcmp(t, "VFRAME") == 0)
-		{
-			monitor_run_frame(TRUE, Atari800_live_monitor_audio);
-			pause_live_refresh = 1;
-		}
+			else if (strcmp(t, "SHOW") == 0)
+				show_state();
+			else if (strcmp(t, "SYNC") == 0)
+				monitor_force_refresh(TRUE, monitor_headless_enabled && RemoteMonitor_HasClients() && Atari800_audio_on_debug);
+			else if (strcmp(t, "VFRAME") == 0)
+			{
+				monitor_run_frame(TRUE, monitor_headless_enabled && RemoteMonitor_HasClients() && Atari800_audio_on_debug);
+				pause_live_refresh = 1;
+			}
 		else if (strcmp(t, "STACK") == 0)
 			show_stack();
 		else if (strcmp(t, "ROM") == 0)

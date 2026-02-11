@@ -1,3 +1,21 @@
+Next version (2026/??/??)
+=========================
+
+ New features:
+ -------------
+  * Added Remote Monitor runtime integration (enable with `-remote-monitor`).
+  * Remote Monitor provides live emulation preview during remote debugging sessions.
+  * Safer Remote Monitor socket path handling: emulator cleanup removes only
+    sockets created by the current process.
+
+ Limitations:
+ ------------
+  * Remote Monitor is currently available on Unix-like platforms
+    (Linux, macOS, BSD).
+  * Remote Monitor socket transport does not replace existing socket paths
+    automatically; remove stale files manually or choose another path.
+
+
 Version 5.3.0 (2024/xx/xx)
 ==========================
 

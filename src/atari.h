@@ -123,10 +123,8 @@ extern int Atari800_turbo_speed;
 /* Set to TRUE to start in the monitor. It's up to each port's
 	main.c to implement this (initially only SDL supports it). */
 extern int Atari800_start_in_monitor;
-/* Set to TRUE to refresh video while monitor is active. */
-extern int Atari800_live_monitor;
-/* Set to TRUE to refresh audio while monitor is active. */
-extern int Atari800_live_monitor_audio;
+/* Set to TRUE to keep audio enabled while debugging in monitor mode. */
+extern int Atari800_audio_on_debug;
 
 /* Initializes Atari800 emulation core. */
 int Atari800_Initialise(int *argc, char *argv[]);

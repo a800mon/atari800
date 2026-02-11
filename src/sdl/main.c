@@ -41,6 +41,9 @@
 #include "log.h"
 #include "monitor.h"
 #include "platform.h"
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+#include "../remotemonitor.h"
+#endif
 #ifdef SOUND
 #include "../pokeysnd.h"
 #include "../sound.h"
@@ -123,15 +126,22 @@ int PLATFORM_Exit(int run_monitor)
 #ifdef SOUND
 		Sound_Pause();
 #endif
-		if (MONITOR_Run()) {
-			/* set up graphics and all the stuff */
-			VIDEOMODE_ForceWindowed(FALSE);
-			SDL_INPUT_Restart();
+			if (MONITOR_Run()) {
+				/* set up graphics and all the stuff */
+				VIDEOMODE_ForceWindowed(FALSE);
+				SDL_INPUT_Restart();
 #ifdef SOUND
-			Sound_Continue();
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H) && defined(MONITOR_BREAK)
+				if (RemoteMonitor_Enabled() && !Atari800_GetBuiltinMonitor() &&
+				    RemoteMonitor_HasClients() &&
+				    !Atari800_audio_on_debug &&
+				    (MONITOR_break_step || MONITOR_break_ret))
+					return 1;
 #endif
-			return 1;
-		}
+				Sound_Continue();
+#endif
+				return 1;
+			}
 	}
 
 	SDL_VIDEO_Exit();

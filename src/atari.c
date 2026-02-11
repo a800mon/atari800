@@ -73,7 +73,7 @@
 #include "cartridge.h"
 #include "cassette.h"
 #include "cfg.h"
-#include "socketserver.h"
+#include "remotemonitor.h"
 #include "cpu.h"
 #include "devices.h"
 #include "esc.h"
@@ -184,8 +184,7 @@ int Atari800_collisions_in_skipped_frames = FALSE;
 int Atari800_turbo = FALSE;
 int Atari800_turbo_speed = 0; /* percentage speed or 0 for max turbo */
 int Atari800_start_in_monitor = FALSE;
-int Atari800_live_monitor = FALSE;
-int Atari800_live_monitor_audio = FALSE;
+int Atari800_audio_on_debug = TRUE;
 int Atari800_auto_frameskip = FALSE;
 static int atari800_reset_frame = 0;
 static int atari800_saved_argc = 0;
@@ -764,22 +763,75 @@ int Atari800_Initialise(int *argc, char *argv[])
 				if (i_a) run_direct = argv[++i]; else a_m = TRUE;
 			}
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
-			else if (strcmp(argv[i], "-socket") == 0) {
-				if (i_a) {
-					SocketServer_SetPath(argv[++i]);
-					/* With RPC socket enabled, default to headless monitor. */
+				else if (strcmp(argv[i], "-remote-monitor") == 0) {
+					RemoteMonitor_EnableDefault();
+					if (!RemoteMonitor_Enabled()) {
+						Log_print("Remote Monitor default configuration is not supported on this platform.");
+						return FALSE;
+					}
+					/* With Remote Monitor enabled, default to headless monitor. */
 					Atari800_SetBuiltinMonitor(FALSE);
 				}
-				else a_m = TRUE;
-			}
-#else
-			else if (strcmp(argv[i], "-socket") == 0) {
-				if (i_a) {
-					Log_print("socket: not supported on this platform");
-					++i;
+				else if (strcmp(argv[i], "-no-remote-monitor") == 0) {
+					RemoteMonitor_Disable();
 				}
-				else a_m = TRUE;
-			}
+				else if (strcmp(argv[i], "-remote-monitor-transport") == 0) {
+					if (i_a) {
+						const char *transport = argv[++i];
+						if (!RemoteMonitor_SetTransport(transport)) {
+							Log_print("Invalid Remote Monitor transport \"%s\". Supported values: socket.", transport);
+							return FALSE;
+						}
+						if (strcmp(transport, "socket") == 0 && RemoteMonitor_GetSocketPath() == NULL) {
+							const char *default_socket_path = RemoteMonitor_DefaultSocketPath();
+							if (default_socket_path != NULL)
+								RemoteMonitor_SetSocketPath(default_socket_path);
+						}
+						if (RemoteMonitor_Enabled())
+							Atari800_SetBuiltinMonitor(FALSE);
+					}
+					else
+						a_m = TRUE;
+				}
+				else if (strcmp(argv[i], "-remote-monitor-socket-path") == 0) {
+					if (i_a) {
+						const char *socket_path = argv[++i];
+						if (strcmp(socket_path, "DEFAULT") == 0) {
+							const char *default_socket_path = RemoteMonitor_DefaultSocketPath();
+							if (default_socket_path == NULL) {
+								Log_print("The -remote-monitor-socket-path DEFAULT option is not supported for Remote Monitor on this platform.");
+								return FALSE;
+							}
+							RemoteMonitor_SetSocketPath(default_socket_path);
+						}
+						else
+							RemoteMonitor_SetSocketPath(socket_path);
+
+						if (RemoteMonitor_GetTransport() == NULL)
+							RemoteMonitor_SetTransport("socket");
+						if (RemoteMonitor_Enabled())
+							Atari800_SetBuiltinMonitor(FALSE);
+					}
+					else
+						a_m = TRUE;
+				}
+#else
+				else if (strcmp(argv[i], "-remote-monitor") == 0) {
+					Log_print("Remote Monitor is not supported on this platform.");
+				}
+				else if (strcmp(argv[i], "-no-remote-monitor") == 0) {
+					Log_print("Remote Monitor is not supported on this platform.");
+				}
+				else if (strcmp(argv[i], "-remote-monitor-transport") == 0) {
+					if (i_a)
+						++i;
+					Log_print("Remote Monitor is not supported on this platform.");
+				}
+				else if (strcmp(argv[i], "-remote-monitor-socket-path") == 0) {
+					if (i_a)
+						++i;
+					Log_print("Remote Monitor is not supported on this platform.");
+				}
 #endif
 #ifdef R_IO_DEVICE
 			else if (strcmp(argv[i], "-rdevice") == 0) {
@@ -850,10 +902,10 @@ int Atari800_Initialise(int *argc, char *argv[])
 #endif /* BASIC */
 			else if (strcmp(argv[i], "-monitor") == 0)
 				Atari800_start_in_monitor = TRUE;
-			else if (strcmp(argv[i], "-live-monitor") == 0)
-				Atari800_live_monitor = TRUE;
-			else if (strcmp(argv[i], "-live-monitor-audio") == 0)
-				Atari800_live_monitor_audio = TRUE;
+			else if (strcmp(argv[i], "-remote-monitor-audio-on-debug") == 0)
+				Atari800_audio_on_debug = TRUE;
+			else if (strcmp(argv[i], "-no-remote-monitor-audio-on-debug") == 0)
+				Atari800_audio_on_debug = FALSE;
 #ifdef MONITOR_HINTS
 			else if (strcmp(argv[i], "-label-file") == 0)
 				if (i_a) MONITOR_PreloadLabelFile(argv[++i]); else a_m = TRUE;
@@ -891,7 +943,15 @@ int Atari800_Initialise(int *argc, char *argv[])
 					Log_print("\t-ntsc            Enable NTSC TV mode");
 					Log_print("\t-run <file>      Run Atari program (COM, EXE, XEX, BAS, LST)");
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
-					Log_print("\t-socket <path>   Read binary commands from a UNIX socket");
+						Log_print("\t-remote-monitor  Enable Remote Monitor");
+						Log_print("\t-no-remote-monitor");
+						Log_print("\t                 Disable Remote Monitor");
+						Log_print("\t-remote-monitor-transport <name>");
+						Log_print("\t                 Set Remote Monitor transport (currently: socket)");
+						Log_print("\t-remote-monitor-socket-path <path>");
+						Log_print("\t                 Set UNIX socket path for Remote Monitor socket transport");
+						if (RemoteMonitor_DefaultSocketPath() != NULL)
+							Log_print("\t                 Default socket path: \"%s\"", RemoteMonitor_DefaultSocketPath());
 #endif
 #ifndef BASIC
 					Log_print("\t-state <file>    Load saved-state file");
@@ -915,10 +975,11 @@ int Atari800_Initialise(int *argc, char *argv[])
 					Log_print("\t-stereo          Turn on emulation of two POKEYs");
 					Log_print("\t-nostereo        Turn off emulation of two POKEYs");
 #endif
-					Log_print("\t-turbo           Run emulated Atari as fast as possible");
-					Log_print("\t-monitor         Start emulated Atari in the monitor");
-					Log_print("\t-live-monitor    Refresh video while monitor is active");
-					Log_print("\t-live-monitor-audio Refresh audio while monitor is active");
+						Log_print("\t-turbo           Run emulated Atari as fast as possible");
+						Log_print("\t-monitor         Start emulated Atari in the monitor");
+						Log_print("\t-remote-monitor-audio-on-debug  Keep audio enabled while debugging (default)");
+						Log_print("\t-no-remote-monitor-audio-on-debug");
+						Log_print("\t                 Disable audio while debugging");
 #ifdef MONITOR_BREAK
 					Log_print("\t-bbrk            Break on BRK instruction");
 					Log_print("\t-bpc <addr>      Break on PC=<addr>");
@@ -1195,7 +1256,8 @@ int Atari800_Exit(int run_monitor)
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
 	if (run_monitor) {
 		int headless_requested = monitor_headless_pending || monitor_headless_active;
-		if (!headless_requested && SocketServer_Enabled() && !monitor_builtin_enabled)
+		if (!headless_requested && RemoteMonitor_Enabled() && !monitor_builtin_enabled &&
+		    RemoteMonitor_HasClients())
 			headless_requested = TRUE;
 		if (headless_requested) {
 			if (!MONITOR_EnableHeadlessIO()) {
@@ -1272,7 +1334,7 @@ int Atari800_Exit(int run_monitor)
 #endif
 		MONITOR_Exit();
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
-		SocketServer_CloseAll();
+		RemoteMonitor_CloseAll();
 #endif
 #ifdef SDL
 		SDL_INIT_Exit();
@@ -1306,7 +1368,7 @@ int Atari800_RestartProcess(void)
 	execvp(atari800_saved_argv[0], atari800_saved_argv);
 	Log_print("Failed to restart process \"%s\": %s.",
 		atari800_saved_argv[0], strerror(errno));
-	return FALSE;
+	exit(1);
 #else
 	return FALSE;
 #endif
@@ -1375,14 +1437,14 @@ void Atari800_Sync(void)
 	if (Atari800_auto_frameskip)
 		autoframeskip(curtime, lasttime);
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
-	if (SocketServer_Enabled() && lasttime > curtime) {
+	if (RemoteMonitor_Enabled() && lasttime > curtime) {
 		double endtime = lasttime;
 		double remaining = endtime - curtime;
 		const double slice = 0.002;
 		while (remaining > 0.0) {
 			double step = remaining > slice ? slice : remaining;
 			Util_sleep(step);
-			SocketServer_Poll();
+			RemoteMonitor_Poll();
 			curtime = Util_time();
 			remaining = endtime - curtime;
 		}
@@ -1556,15 +1618,16 @@ void Atari800_Frame(void)
 	static int refresh_counter = 0;
 
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
-	SocketServer_Poll();
+	RemoteMonitor_Poll();
 #endif
 
 #ifdef CTRL_C_HANDLER
 	if (sigint_flag) {
 		sigint_flag = FALSE;
-		/* In socket/headless-debug mode Ctrl+C should terminate emulator,
+		/* In remote-monitor headless mode Ctrl+C should terminate emulator,
 		   not enter a monitor with no interactive stdin. */
-		if (SocketServer_Enabled() && !Atari800_GetBuiltinMonitor())
+		if (RemoteMonitor_Enabled() && !Atari800_GetBuiltinMonitor() &&
+		    RemoteMonitor_HasClients())
 			INPUT_key_code = AKEY_EXIT;
 		else {
 			INPUT_key_code = AKEY_UI;
@@ -1595,15 +1658,22 @@ void Atari800_Frame(void)
 	case AKEY_TURBO:
 		Atari800_turbo = !Atari800_turbo;
 		break;
-	case AKEY_UI:
+		case AKEY_UI:
 #ifdef SOUND
-		Sound_Pause();
+			Sound_Pause();
 #endif
-		UI_Run();
+			UI_Run();
 #ifdef SOUND
-		Sound_Continue();
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H) && defined(MONITOR_BREAK)
+			if (RemoteMonitor_Enabled() && !Atari800_GetBuiltinMonitor() &&
+			    RemoteMonitor_HasClients() &&
+			    !Atari800_audio_on_debug &&
+			    (MONITOR_break_step || MONITOR_break_ret))
+				break;
 #endif
-		break;
+			Sound_Continue();
+#endif
+			break;
 #ifdef SCREENSHOTS
 	case AKEY_SCREENSHOT:
 		Screen_SaveNextScreenshot(FALSE);
