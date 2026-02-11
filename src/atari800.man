@@ -569,6 +569,12 @@ Disable automatic reboot after cartridge inserting/removing.
 .BI \-run\  filename
 Run Atari program (EXE, COM, XEX, BAS, LST)
 .TP
+.BI \-monitor\-pty\  [path]
+Use PTY for monitor I/O. If path is provided, create a symlink to the PTY slave.
+.TP
+.BI \-socket\  path
+Read binary commands from a UNIX socket.
+.TP
 .BI \-state\  filename
 Load saved-state file
 .TP

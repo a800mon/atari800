@@ -29,12 +29,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdint.h>
 #if defined(HAVE_SIGNAL_H) && !defined(LIBATARI800)
 #define CTRL_C_HANDLER
 #include <signal.h>
 #endif
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
+#endif
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/stat.h>
 #endif
 #ifdef HAVE_WINDOWS_H
 #include <windows.h>
@@ -64,6 +73,7 @@
 #include "cartridge.h"
 #include "cassette.h"
 #include "cfg.h"
+#include "socketserver.h"
 #include "cpu.h"
 #include "devices.h"
 #include "esc.h"
@@ -174,7 +184,12 @@ int Atari800_collisions_in_skipped_frames = FALSE;
 int Atari800_turbo = FALSE;
 int Atari800_turbo_speed = 0; /* percentage speed or 0 for max turbo */
 int Atari800_start_in_monitor = FALSE;
+int Atari800_live_monitor = FALSE;
+int Atari800_live_monitor_audio = FALSE;
 int Atari800_auto_frameskip = FALSE;
+static int atari800_reset_frame = 0;
+static int atari800_saved_argc = 0;
+static char **atari800_saved_argv = NULL;
 
 #ifdef BENCHMARK
 static double benchmark_start_time;
@@ -191,6 +206,54 @@ static RETSIGTYPE sigint_handler(int num)
 	return;
 }
 #endif
+
+static void Atari800_ClearSavedArgv(void)
+{
+	int i;
+	if (atari800_saved_argv == NULL)
+		return;
+	for (i = 0; i < atari800_saved_argc; i++) {
+		free(atari800_saved_argv[i]);
+		atari800_saved_argv[i] = NULL;
+	}
+	free(atari800_saved_argv);
+	atari800_saved_argv = NULL;
+	atari800_saved_argc = 0;
+}
+
+static int Atari800_SaveProcessArgv(int argc, char *argv[])
+{
+	int i;
+	char **copy;
+
+	Atari800_ClearSavedArgv();
+	if (argc <= 0 || argv == NULL || argv[0] == NULL)
+		return FALSE;
+
+	copy = (char **)calloc((size_t)argc + 1, sizeof(char *));
+	if (copy == NULL) {
+		Log_print("Failed to save startup arguments: out of memory.");
+		return FALSE;
+	}
+
+	for (i = 0; i < argc; i++) {
+		if (argv[i] == NULL)
+			break;
+		copy[i] = Util_strdup(argv[i]);
+	}
+	if (i == 0 || copy[0] == NULL || copy[0][0] == '\0') {
+		int j;
+		for (j = 0; j < i; j++)
+			free(copy[j]);
+		free(copy);
+		Log_print("Failed to save startup arguments: invalid argv[0].");
+		return FALSE;
+	}
+
+	atari800_saved_argv = copy;
+	atari800_saved_argc = i;
+	return TRUE;
+}
 
 void Atari800_SetMachineType(int type)
 {
@@ -246,6 +309,7 @@ void Atari800_Warmstart(void)
 	if (netsio_enabled)
 		netsio_warm_reset();
 #endif /* NETSIO */
+	atari800_reset_frame = Atari800_nframes;
 }
 
 void Atari800_Coldstart(void)
@@ -282,6 +346,27 @@ void Atari800_Coldstart(void)
 	if(netsio_enabled)
 		netsio_cold_reset();
 #endif /* NETSIO */
+	atari800_reset_frame = Atari800_nframes;
+}
+
+static double Atari800_GetFrameRate(void)
+{
+	return Atari800_tv_mode == Atari800_TV_PAL ? Atari800_FPS_PAL : Atari800_FPS_NTSC;
+}
+
+double Atari800_GetEmulationSeconds(void)
+{
+	double fps = Atari800_GetFrameRate();
+	return fps > 0.0 ? ((double)Atari800_nframes / fps) : 0.0;
+}
+
+double Atari800_GetEmulationSecondsSinceReset(void)
+{
+	double fps = Atari800_GetFrameRate();
+	int frames = Atari800_nframes - atari800_reset_frame;
+	if (frames < 0)
+		frames = 0;
+	return fps > 0.0 ? ((double)frames / fps) : 0.0;
 }
 
 int Atari800_LoadImage(const char *filename, UBYTE *buffer, int nbytes)
@@ -359,6 +444,43 @@ static void PreInitialise(void)
 #endif
 }
 
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+static int monitor_break_pending = FALSE;
+static int monitor_headless_pending = FALSE;
+static int monitor_headless_active = FALSE;
+static int monitor_builtin_enabled = TRUE;
+
+void Atari800_RequestMonitor(void)
+{
+	monitor_break_pending = TRUE;
+}
+
+void Atari800_RequestMonitorHeadless(void)
+{
+	monitor_headless_pending = TRUE;
+	monitor_break_pending = TRUE;
+}
+
+void Atari800_SetBuiltinMonitor(int enabled)
+{
+	monitor_builtin_enabled = enabled ? TRUE : FALSE;
+}
+
+int Atari800_GetBuiltinMonitor(void)
+{
+	return monitor_builtin_enabled;
+}
+#endif
+
+int Atari800_IsSigintPending(void)
+{
+#ifdef CTRL_C_HANDLER
+	return sigint_flag ? TRUE : FALSE;
+#else
+	return FALSE;
+#endif
+}
+
 int Atari800_Initialise(int *argc, char *argv[])
 {
 	int i, j;
@@ -366,6 +488,9 @@ int Atari800_Initialise(int *argc, char *argv[])
 #ifndef BASIC
 	const char *state_file = NULL;
 #endif
+
+	Atari800_SaveProcessArgv(*argc, argv);
+
 #ifdef __PLUS
 	/* Atari800Win PLus doesn't use configuration files,
 	   it reads configuration from the Registry */
@@ -638,6 +763,24 @@ int Atari800_Initialise(int *argc, char *argv[])
 			if (strcmp(argv[i], "-run") == 0) {
 				if (i_a) run_direct = argv[++i]; else a_m = TRUE;
 			}
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+			else if (strcmp(argv[i], "-socket") == 0) {
+				if (i_a) {
+					SocketServer_SetPath(argv[++i]);
+					/* With RPC socket enabled, default to headless monitor. */
+					Atari800_SetBuiltinMonitor(FALSE);
+				}
+				else a_m = TRUE;
+			}
+#else
+			else if (strcmp(argv[i], "-socket") == 0) {
+				if (i_a) {
+					Log_print("socket: not supported on this platform");
+					++i;
+				}
+				else a_m = TRUE;
+			}
+#endif
 #ifdef R_IO_DEVICE
 			else if (strcmp(argv[i], "-rdevice") == 0) {
 				Devices_enable_r_patch = TRUE;
@@ -707,6 +850,10 @@ int Atari800_Initialise(int *argc, char *argv[])
 #endif /* BASIC */
 			else if (strcmp(argv[i], "-monitor") == 0)
 				Atari800_start_in_monitor = TRUE;
+			else if (strcmp(argv[i], "-live-monitor") == 0)
+				Atari800_live_monitor = TRUE;
+			else if (strcmp(argv[i], "-live-monitor-audio") == 0)
+				Atari800_live_monitor_audio = TRUE;
 #ifdef MONITOR_HINTS
 			else if (strcmp(argv[i], "-label-file") == 0)
 				if (i_a) MONITOR_PreloadLabelFile(argv[++i]); else a_m = TRUE;
@@ -743,6 +890,9 @@ int Atari800_Initialise(int *argc, char *argv[])
 					Log_print("\t-pal             Enable PAL TV mode");
 					Log_print("\t-ntsc            Enable NTSC TV mode");
 					Log_print("\t-run <file>      Run Atari program (COM, EXE, XEX, BAS, LST)");
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+					Log_print("\t-socket <path>   Read binary commands from a UNIX socket");
+#endif
 #ifndef BASIC
 					Log_print("\t-state <file>    Load saved-state file");
 					Log_print("\t-refresh <rate>  Specify screen refresh rate");
@@ -767,6 +917,8 @@ int Atari800_Initialise(int *argc, char *argv[])
 #endif
 					Log_print("\t-turbo           Run emulated Atari as fast as possible");
 					Log_print("\t-monitor         Start emulated Atari in the monitor");
+					Log_print("\t-live-monitor    Refresh video while monitor is active");
+					Log_print("\t-live-monitor-audio Refresh audio while monitor is active");
 #ifdef MONITOR_BREAK
 					Log_print("\t-bbrk            Break on BRK instruction");
 					Log_print("\t-bpc <addr>      Break on PC=<addr>");
@@ -996,6 +1148,9 @@ int Atari800_Initialise(int *argc, char *argv[])
 	}
 #endif /* SOUND */
 
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+#endif
+
 	return TRUE;
 }
 
@@ -1037,7 +1192,36 @@ int Atari800_Exit(int run_monitor)
 			sums[0], sums[1], sums[2], sums[3], sums[4], sums[5]);
 	}
 #endif /* STAT_UNALIGNED_WORDS */
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (run_monitor) {
+		int headless_requested = monitor_headless_pending || monitor_headless_active;
+		if (!headless_requested && SocketServer_Enabled() && !monitor_builtin_enabled)
+			headless_requested = TRUE;
+		if (headless_requested) {
+			if (!MONITOR_EnableHeadlessIO()) {
+				monitor_headless_pending = FALSE;
+				return TRUE;
+			}
+			monitor_headless_active = TRUE;
+		}
+	}
+#endif
 	restart = PLATFORM_Exit(run_monitor);
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (monitor_headless_active) {
+		int keep_headless = 0;
+#ifdef MONITOR_BREAK
+		if (MONITOR_break_step)
+			keep_headless = 1;
+#endif
+		if (!keep_headless) {
+			MONITOR_DisableHeadlessIO();
+			monitor_headless_active = FALSE;
+		}
+	}
+	if (!monitor_headless_active)
+		monitor_headless_pending = FALSE;
+#endif
 #ifdef CTRL_C_HANDLER
 	/* If a user pressed Ctrl+C in the monitor, avoid immediate return to it. */
 	sigint_flag = FALSE;
@@ -1087,12 +1271,45 @@ int Atari800_Exit(int run_monitor)
 		File_Export_StopRecording();
 #endif
 		MONITOR_Exit();
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+		SocketServer_CloseAll();
+#endif
 #ifdef SDL
 		SDL_INIT_Exit();
 #endif /* SDL */
 	}
 #endif /* __PLUS */
 	return restart;
+}
+
+int Atari800_CanRestartProcess(void)
+{
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	return atari800_saved_argc > 0
+		&& atari800_saved_argv != NULL
+		&& atari800_saved_argv[0] != NULL
+		&& atari800_saved_argv[0][0] != '\0';
+#else
+	return FALSE;
+#endif
+}
+
+int Atari800_RestartProcess(void)
+{
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (!Atari800_CanRestartProcess()) {
+		Log_print("Process restart is not available.");
+		return FALSE;
+	}
+
+	Atari800_Exit(FALSE);
+	execvp(atari800_saved_argv[0], atari800_saved_argv);
+	Log_print("Failed to restart process \"%s\": %s.",
+		atari800_saved_argv[0], strerror(errno));
+	return FALSE;
+#else
+	return FALSE;
+#endif
 }
 
 void Atari800_ErrExit(void)
@@ -1157,7 +1374,24 @@ void Atari800_Sync(void)
 	curtime = Util_time();
 	if (Atari800_auto_frameskip)
 		autoframeskip(curtime, lasttime);
-	Util_sleep(lasttime - curtime);
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (SocketServer_Enabled() && lasttime > curtime) {
+		double endtime = lasttime;
+		double remaining = endtime - curtime;
+		const double slice = 0.002;
+		while (remaining > 0.0) {
+			double step = remaining > slice ? slice : remaining;
+			Util_sleep(step);
+			SocketServer_Poll();
+			curtime = Util_time();
+			remaining = endtime - curtime;
+		}
+	}
+	else
+#endif
+	{
+		Util_sleep(lasttime - curtime);
+	}
 	curtime = Util_time();
 
 	if ((lasttime + deltatime) < curtime)
@@ -1321,13 +1555,32 @@ void Atari800_Frame(void)
 #ifndef BASIC
 	static int refresh_counter = 0;
 
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	SocketServer_Poll();
+#endif
+
 #ifdef CTRL_C_HANDLER
 	if (sigint_flag) {
 		sigint_flag = FALSE;
+		/* In socket/headless-debug mode Ctrl+C should terminate emulator,
+		   not enter a monitor with no interactive stdin. */
+		if (SocketServer_Enabled() && !Atari800_GetBuiltinMonitor())
+			INPUT_key_code = AKEY_EXIT;
+		else {
+			INPUT_key_code = AKEY_UI;
+			UI_alt_function = UI_MENU_MONITOR;
+		}
+	}
+#endif /* CTRL_C_HANDLER */
+
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+	if (monitor_break_pending) {
+		monitor_break_pending = FALSE;
 		INPUT_key_code = AKEY_UI;
 		UI_alt_function = UI_MENU_MONITOR;
 	}
-#endif /* CTRL_C_HANDLER */
+#endif
+
 
 	switch (INPUT_key_code) {
 	case AKEY_COLDSTART:
@@ -1603,3 +1856,26 @@ void Atari800_SetTVMode(int mode)
 #endif /* SOUND */
 	}
 }
+
+#if !defined(HAVE_UNISTD_H) || defined(HAVE_WINDOWS_H)
+void Atari800_RequestMonitor(void)
+{
+	INPUT_key_code = AKEY_UI;
+	UI_alt_function = UI_MENU_MONITOR;
+}
+
+void Atari800_RequestMonitorHeadless(void)
+{
+	Atari800_RequestMonitor();
+}
+
+void Atari800_SetBuiltinMonitor(int enabled)
+{
+	(void)enabled;
+}
+
+int Atari800_GetBuiltinMonitor(void)
+{
+	return TRUE;
+}
+#endif
