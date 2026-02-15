@@ -69,7 +69,12 @@ void curses_display_line(int anticmode, const UBYTE *screendata);
 int PLATFORM_IsKbdJoystickEnabled(int num);
 void PLATFORM_ToggleKbdJoystickEnabled(int num);
 int PLATFORM_GetRawKey(void);
+int PLATFORM_InjectScancode(int action, int scancode, int mods);
 #endif /* GUI_SDL */
+
+#ifndef GUI_SDL
+#define PLATFORM_InjectScancode(action, scancode, mods) (0)
+#endif
 
 #if SUPPORTS_CHANGE_VIDEOMODE
 /* Returns whether the platform-specific code support the given display mode, MODE,

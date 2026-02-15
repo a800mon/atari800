@@ -155,6 +155,17 @@ int OSK_enabled = 1;
 
 static void Init_SDL_Joysticks(void);
 
+#if SDL2
+#define SDL_INPUT_REMOTE_MOD_SHIFT 0x01
+#define SDL_INPUT_REMOTE_MOD_CTRL 0x02
+#define SDL_INPUT_REMOTE_MOD_ALT 0x04
+
+static int remote_key_pending = FALSE;
+static int remote_key_action = 0;
+static int remote_key_mods = 0;
+static SDL_Keycode remote_keycode = SDLK_UNKNOWN;
+#endif
+
 static int get_key_state(const Uint8* kbhits, int keycode) {
 #if SDL2
 	keycode &= ~SDLK_SCANCODE_MASK;
@@ -628,6 +639,8 @@ int PLATFORM_Keyboard(void)
 	int shiftctrl = 0;
 	SDL_Event event;
 	int keyboad_event_found = FALSE;
+	int remote_override = FALSE;
+	int remote_mods = 0;
 
 #ifdef USE_UI_BASIC_ONSCREEN_KEYBOARD
 	if (!atari_screen_backup)
@@ -651,6 +664,23 @@ int PLATFORM_Keyboard(void)
 		lastkey = SDLK_UNKNOWN;
 		key_pressed = 0;
  		lastuni = 0;
+	}
+#endif
+
+#if SDL2
+	if (remote_key_pending) {
+		keyboad_event_found = TRUE;
+		lastkey = remote_keycode;
+		lastuni = 0;
+		if (remote_key_action)
+			key_pressed = 1;
+		else
+			key_pressed = 0;
+		if (remote_keycode > 0 && remote_keycode < 0x80 && remote_key_action)
+			lastuni = (int)remote_keycode;
+		remote_override = TRUE;
+		remote_mods = remote_key_mods;
+		remote_key_pending = FALSE;
 	}
 #endif
 
@@ -859,7 +889,7 @@ int PLATFORM_Keyboard(void)
 	}
 
 	UI_alt_function = -1;
-	if (get_key_state(kbhits, SDLK_LALT)) {
+	if (!remote_override && get_key_state(kbhits, SDLK_LALT)) {
 		if (key_pressed) {
 			switch (lastkey) {
 			case SDLK_f:
@@ -1082,6 +1112,17 @@ int PLATFORM_Keyboard(void)
 	} else {
 		key_control = 0;
 	}
+#if SDL2
+	if (remote_override) {
+		INPUT_key_shift = (remote_mods & SDL_INPUT_REMOTE_MOD_SHIFT) != 0;
+		key_control = (remote_mods & SDL_INPUT_REMOTE_MOD_CTRL) != 0;
+		shiftctrl = 0;
+		if (INPUT_key_shift)
+			shiftctrl ^= AKEY_SHFT;
+		if (key_control)
+			shiftctrl ^= AKEY_CTRL;
+	}
+#endif
 
 	/*
 	if (event.type == 2 || event.type == 3) {
@@ -1111,42 +1152,44 @@ int PLATFORM_Keyboard(void)
 
 	/* Since KBD_RESET & KBD_EXIT are variables, they can't be cases */
 	/* in a switch statement.  So handle them here with if-blocks */
-	if (lastkey == KBD_RESET) {
-		key_pressed = 0;
-		return INPUT_key_shift ? AKEY_COLDSTART : AKEY_WARMSTART;
-	}
-	if (lastkey == KBD_EXIT) {
-		return AKEY_EXIT;
-	}
-	if (lastkey == KBD_UI) {
-		key_pressed = 0;
-		return AKEY_UI;
-	}
-	if (lastkey == KBD_MON) {
-		UI_alt_function = UI_MENU_MONITOR;
-	}
-	if (lastkey == KBD_HELP) {
-		return AKEY_HELP ^ shiftctrl;
-	}
-	if (lastkey == KBD_BREAK) {
-		if (BINLOAD_wait_active) {
-			BINLOAD_pause_loading = TRUE;
-			return AKEY_NONE;
+	if (!remote_override) {
+		if (lastkey == KBD_RESET) {
+			key_pressed = 0;
+			return INPUT_key_shift ? AKEY_COLDSTART : AKEY_WARMSTART;
 		}
-		else
-			return AKEY_BREAK;
-	}
-	if (lastkey == KBD_SSHOT) {
-		key_pressed = 0;
-		return INPUT_key_shift ? AKEY_SCREENSHOT_INTERLACE : AKEY_SCREENSHOT;
-	}
-	if (lastkey == KBD_TURBO) {
-		key_pressed = 0;
-		return AKEY_TURBO;
-	}
-	if (UI_alt_function != -1) {
-		key_pressed = 0;
-		return AKEY_UI;
+		if (lastkey == KBD_EXIT) {
+			return AKEY_EXIT;
+		}
+		if (lastkey == KBD_UI) {
+			key_pressed = 0;
+			return AKEY_UI;
+		}
+		if (lastkey == KBD_MON) {
+			UI_alt_function = UI_MENU_MONITOR;
+		}
+		if (lastkey == KBD_HELP) {
+			return AKEY_HELP ^ shiftctrl;
+		}
+		if (lastkey == KBD_BREAK) {
+			if (BINLOAD_wait_active) {
+				BINLOAD_pause_loading = TRUE;
+				return AKEY_NONE;
+			}
+			else
+				return AKEY_BREAK;
+		}
+		if (lastkey == KBD_SSHOT) {
+			key_pressed = 0;
+			return INPUT_key_shift ? AKEY_SCREENSHOT_INTERLACE : AKEY_SCREENSHOT;
+		}
+		if (lastkey == KBD_TURBO) {
+			key_pressed = 0;
+			return AKEY_TURBO;
+		}
+		if (UI_alt_function != -1) {
+			key_pressed = 0;
+			return AKEY_UI;
+		}
 	}
 
 	/* keyboard joysticks: don't pass the keypresses to emulation
@@ -1607,6 +1650,34 @@ int PLATFORM_Keyboard(void)
 	}
 
 	return AKEY_NONE;
+}
+
+int PLATFORM_InjectScancode(int action, int scancode, int mods)
+{
+#if SDL2
+	SDL_Scancode sdl_scancode;
+	SDL_Keycode keycode;
+
+	if (action != 0 && action != 1)
+		return FALSE;
+	if (scancode <= 0 || scancode >= SDL_NUM_SCANCODES)
+		return FALSE;
+	sdl_scancode = (SDL_Scancode)scancode;
+	keycode = SDL_GetKeyFromScancode(sdl_scancode);
+	if (keycode == SDLK_UNKNOWN)
+		return FALSE;
+
+	remote_key_action = action;
+	remote_key_mods = mods;
+	remote_keycode = keycode;
+	remote_key_pending = TRUE;
+	return TRUE;
+#else
+	(void)action;
+	(void)scancode;
+	(void)mods;
+	return FALSE;
+#endif
 }
 
 void SDL_INPUT_Mouse(void)

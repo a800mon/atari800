@@ -78,6 +78,20 @@ These values are read on startup and written by configuration save, so GUI
 - `REMOTE_MONITOR_AUDIO_ON_DEBUG=0`: audio stays paused in debug flow to avoid unwanted output
   during step/frame refresh.
 
+## Remote Input (RPC)
+
+Remote Monitor can inject input via RPC:
+
+- `INPUT_KEY` sends HID scancode key up/down events with modifier bits (`keyspace` must be `1`).
+- HID scancodes are delivered to the SDL keyboard path on SDL builds.
+- `INPUT_JOYSTICKS` sets joystick 1/2 state bits.
+- `INPUT_SPECIAL` sets Help/Start/Select/Option/Reset/Break state bits.
+- Only one remote key is tracked; the latest key-down wins and must be released with a matching key-up.
+- Joystick and console input are merged with local input; remote keyboard input overrides local
+  keyboard input while a remote key is active.
+- Help/Reset/Break trigger on a press edge; Start/Select/Option are level-based.
+- Remote input state resets when the last client disconnects.
+
 ## Video Stream (UDP)
 
 - UDP video streaming is optional and best-effort (packet loss is tolerated).

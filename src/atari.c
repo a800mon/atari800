@@ -1637,6 +1637,7 @@ void Atari800_Frame(void)
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
 	RemoteMonitor_Poll();
 #endif
+	INPUT_RemoteApply();
 
 #ifdef CTRL_C_HANDLER
 	if (sigint_flag) {

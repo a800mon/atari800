@@ -89,6 +89,11 @@ int INPUT_Recording(void);
 int INPUT_Playingback(void);
 void INPUT_RecordInt(int i);
 int INPUT_PlaybackInt(void);
+void INPUT_RemoteKeyEvent(int keyspace, int action, int keycode, int mods);
+void INPUT_RemoteSetSpecial(unsigned char state);
+void INPUT_RemoteSetJoysticks(unsigned char joy1, unsigned char joy2);
+void INPUT_RemoteApply(void);
+void INPUT_RemoteReset(void);
 
 #ifdef DREAMCAST
 extern int Atari_POT(int);

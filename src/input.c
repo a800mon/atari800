@@ -52,6 +52,32 @@ int INPUT_key_code = AKEY_NONE;
 int INPUT_key_shift = 0;
 int INPUT_key_consol = INPUT_CONSOL_NONE;
 
+static int INPUT_remote_key_active = FALSE;
+static int INPUT_remote_key_code = AKEY_NONE;
+static int INPUT_remote_key_shift = 0;
+static int INPUT_remote_hid_active = FALSE;
+static int INPUT_remote_hid_scancode = 0;
+static unsigned char INPUT_remote_joy[2] = {0, 0};
+static unsigned char INPUT_remote_special = 0;
+static unsigned char INPUT_remote_special_prev = 0;
+
+#define INPUT_REMOTE_JOY_UP 0x01
+#define INPUT_REMOTE_JOY_DOWN 0x02
+#define INPUT_REMOTE_JOY_LEFT 0x04
+#define INPUT_REMOTE_JOY_RIGHT 0x08
+#define INPUT_REMOTE_JOY_FIRE 0x10
+#define INPUT_REMOTE_JOY_MASK (INPUT_REMOTE_JOY_UP | INPUT_REMOTE_JOY_DOWN | INPUT_REMOTE_JOY_LEFT | INPUT_REMOTE_JOY_RIGHT | INPUT_REMOTE_JOY_FIRE)
+#define INPUT_REMOTE_MOD_SHIFT 0x01
+#define INPUT_REMOTE_MOD_CTRL 0x02
+#define INPUT_REMOTE_MOD_ALT 0x04
+#define INPUT_REMOTE_KEYSPACE_HID 1
+#define INPUT_REMOTE_SPECIAL_HELP 0x01
+#define INPUT_REMOTE_SPECIAL_START 0x02
+#define INPUT_REMOTE_SPECIAL_SELECT 0x04
+#define INPUT_REMOTE_SPECIAL_OPTION 0x08
+#define INPUT_REMOTE_SPECIAL_RESET 0x10
+#define INPUT_REMOTE_SPECIAL_BREAK 0x20
+
 int INPUT_joy_autofire[4] = {INPUT_AUTOFIRE_OFF, INPUT_AUTOFIRE_OFF, INPUT_AUTOFIRE_OFF, INPUT_AUTOFIRE_OFF};
 
 int INPUT_joy_block_opposite_directions = 1;
@@ -132,6 +158,120 @@ static int recording_version;
 static char gzbuf[GZBUFSIZE+1];
 #define EVENT_RECORDING_VERSION 1
 #endif
+
+static UBYTE Input_RemoteJoyToStick(unsigned char bits)
+{
+	UBYTE stick = INPUT_STICK_CENTRE;
+
+	if (bits & INPUT_REMOTE_JOY_UP)
+		stick &= INPUT_STICK_FORWARD;
+	if (bits & INPUT_REMOTE_JOY_DOWN)
+		stick &= INPUT_STICK_BACK;
+	if (bits & INPUT_REMOTE_JOY_LEFT)
+		stick &= INPUT_STICK_LEFT;
+	if (bits & INPUT_REMOTE_JOY_RIGHT)
+		stick &= INPUT_STICK_RIGHT;
+
+	return stick;
+}
+
+static UBYTE Input_RemoteJoyToTrig(unsigned char bits)
+{
+	return (bits & INPUT_REMOTE_JOY_FIRE) ? 0 : 1;
+}
+
+void INPUT_RemoteKeyEvent(int keyspace, int action, int keycode, int mods)
+{
+	if (action != 0 && action != 1)
+		return;
+	if (keyspace != INPUT_REMOTE_KEYSPACE_HID)
+		return;
+	if (action == 1) {
+		if (keycode <= 0 || keycode > 255)
+			return;
+		if (INPUT_remote_hid_active &&
+		    INPUT_remote_hid_scancode != keycode) {
+			PLATFORM_InjectScancode(0, INPUT_remote_hid_scancode, 0);
+			INPUT_remote_hid_active = FALSE;
+			INPUT_remote_hid_scancode = 0;
+		}
+		if (!PLATFORM_InjectScancode(1, keycode, mods))
+			return;
+		INPUT_remote_hid_active = TRUE;
+		INPUT_remote_hid_scancode = keycode;
+		return;
+	}
+	if (keycode == 0 || keycode > 255)
+		return;
+	if (!INPUT_remote_hid_active ||
+	    INPUT_remote_hid_scancode != keycode) {
+		return;
+	}
+	if (!PLATFORM_InjectScancode(0, keycode, mods))
+		return;
+	INPUT_remote_hid_active = FALSE;
+	INPUT_remote_hid_scancode = 0;
+}
+
+void INPUT_RemoteSetJoysticks(unsigned char joy1, unsigned char joy2)
+{
+	INPUT_remote_joy[0] = joy1 & INPUT_REMOTE_JOY_MASK;
+	INPUT_remote_joy[1] = joy2 & INPUT_REMOTE_JOY_MASK;
+}
+
+void INPUT_RemoteSetSpecial(unsigned char state)
+{
+	INPUT_remote_special = state;
+}
+
+void INPUT_RemoteApply(void)
+{
+	unsigned char consol_mask = INPUT_CONSOL_NONE;
+	unsigned char special_edge;
+
+	if (INPUT_remote_key_active) {
+		INPUT_key_code = INPUT_remote_key_code;
+		INPUT_key_shift = INPUT_remote_key_shift;
+	}
+	if (INPUT_remote_special & INPUT_REMOTE_SPECIAL_START)
+		consol_mask &= ~INPUT_CONSOL_START;
+	if (INPUT_remote_special & INPUT_REMOTE_SPECIAL_SELECT)
+		consol_mask &= ~INPUT_CONSOL_SELECT;
+	if (INPUT_remote_special & INPUT_REMOTE_SPECIAL_OPTION)
+		consol_mask &= ~INPUT_CONSOL_OPTION;
+	INPUT_key_consol &= consol_mask;
+
+	special_edge = INPUT_remote_special & (unsigned char)~INPUT_remote_special_prev;
+	if (special_edge & INPUT_REMOTE_SPECIAL_RESET) {
+		INPUT_key_code = AKEY_WARMSTART;
+		INPUT_key_shift = 0;
+	}
+	else if (special_edge & INPUT_REMOTE_SPECIAL_BREAK) {
+		INPUT_key_code = AKEY_BREAK;
+		INPUT_key_shift = 0;
+	}
+	else if (special_edge & INPUT_REMOTE_SPECIAL_HELP) {
+		INPUT_key_code = AKEY_HELP;
+		INPUT_key_shift = 0;
+	}
+	INPUT_remote_special_prev = INPUT_remote_special;
+}
+
+void INPUT_RemoteReset(void)
+{
+	INPUT_remote_key_active = FALSE;
+	INPUT_remote_key_code = AKEY_NONE;
+	INPUT_remote_key_shift = 0;
+	if (INPUT_remote_hid_active) {
+		PLATFORM_InjectScancode(0, INPUT_remote_hid_scancode, 0);
+		INPUT_remote_hid_active = FALSE;
+		INPUT_remote_hid_scancode = 0;
+	}
+	INPUT_remote_joy[0] = 0;
+	INPUT_remote_joy[1] = 0;
+	INPUT_remote_special = 0;
+	INPUT_remote_special_prev = 0;
+}
 
 int INPUT_Initialise(int *argc, char *argv[])
 {
@@ -425,6 +565,8 @@ static UBYTE mouse_step(void)
 void INPUT_Frame(void)
 {
 	int i;
+	UBYTE remote_stick[2];
+	UBYTE remote_trig[2];
 	static int last_key_code = AKEY_NONE;
 	static int last_key_break = 0;
 	static UBYTE last_stick[4] = {INPUT_STICK_CENTRE, INPUT_STICK_CENTRE, INPUT_STICK_CENTRE, INPUT_STICK_CENTRE};
@@ -567,6 +709,14 @@ void INPUT_Frame(void)
 	STICK[2] = i & 0x0f;
 	STICK[3] = (i >> 4) & 0x0f;
 
+	remote_stick[0] = Input_RemoteJoyToStick(INPUT_remote_joy[0]);
+	remote_stick[1] = Input_RemoteJoyToStick(INPUT_remote_joy[1]);
+	remote_trig[0] = Input_RemoteJoyToTrig(INPUT_remote_joy[0]);
+	remote_trig[1] = Input_RemoteJoyToTrig(INPUT_remote_joy[1]);
+
+	STICK[0] &= remote_stick[0];
+	STICK[1] &= remote_stick[1];
+
 	for (i = 0; i < 4; i++) {
 		if (INPUT_joy_block_opposite_directions) {
 			if ((STICK[i] & 0x0c) == 0) {	/* right and left simultaneously */
@@ -609,6 +759,8 @@ void INPUT_Frame(void)
 			gzprintf(recordfp,"%d ",TRIG_input[i]);
 		}
 #endif
+		if (i < 2)
+			TRIG_input[i] &= remote_trig[i];
 		if ((INPUT_joy_autofire[i] == INPUT_AUTOFIRE_FIRE && !TRIG_input[i]) || (INPUT_joy_autofire[i] == INPUT_AUTOFIRE_CONT))
 			TRIG_input[i] = (Atari800_nframes & 2) ? 1 : 0;
 	}

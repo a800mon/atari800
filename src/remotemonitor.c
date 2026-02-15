@@ -12,6 +12,7 @@
 #include "colours.h"
 #include "cpu.h"
 #include "gtia.h"
+#include "input.h"
 #include "log.h"
 #include "memory.h"
 #include "monitor.h"
@@ -90,6 +91,7 @@ static struct RemoteMonitorClient remote_monitor_clients[REMOTE_MONITOR_MAX_CLIE
 static void RemoteMonitor_VideoClose(void);
 static int RemoteMonitor_VideoInit(void);
 static void RemoteMonitor_VideoEncodeRow(unsigned char *dst, const UBYTE *src, int width);
+static void RemoteMonitor_ResetInput(void);
 
 
 static unsigned char RemoteMonitor_StatusMachineType(void)
@@ -247,6 +249,11 @@ static unsigned char RemoteMonitor_SysInfoBuiltinGameRevision(void)
 	default:
 		return REMOTE_MONITOR_SYSINFO_BUILTIN_GAME_REVISION_NONE;
 	}
+}
+
+static void RemoteMonitor_ResetInput(void)
+{
+	INPUT_RemoteReset();
 }
 
 int RemoteMonitor_SetTransport(const char *transport)
@@ -540,6 +547,8 @@ static void RemoteMonitor_CloseClient(struct RemoteMonitorClient *client)
 		client->fd = -1;
 	}
 	client->len = 0;
+	if (!RemoteMonitor_HasClients())
+		RemoteMonitor_ResetInput();
 }
 
 static void RemoteMonitor_CloseByFd(int fd)
@@ -576,6 +585,7 @@ void RemoteMonitor_CloseAll(void)
 	}
 	RemoteMonitor_CloseListen();
 	remote_monitor_init_failed = FALSE;
+	RemoteMonitor_ResetInput();
 }
 
 static void RemoteMonitor_VideoClose(void)
@@ -2310,6 +2320,97 @@ static void RemoteMonitor_HandleFrame(struct RemoteMonitorClient *client,
 				RemoteMonitor_NotifyStateChanged();
 				RemoteMonitor_Reply(client->fd, REMOTE_MONITOR_OK, NULL, 0);
 			}
+		}
+		break;
+	case REMOTE_MONITOR_CMD_INPUT_KEY:
+		if (len != 6) {
+			RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_LENGTH,
+				"INPUT_KEY expects a 6-byte payload.");
+			break;
+		}
+		{
+			unsigned char action = payload[0];
+			unsigned char keyspace = payload[1];
+			unsigned char mods = payload[2];
+			unsigned char consol = payload[3];
+			int keycode;
+			if (keyspace != REMOTE_MONITOR_INPUT_KEYSPACE_HID) {
+				RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_VALUE,
+					"INPUT_KEY keyspace must be HID (1).");
+				break;
+			}
+			if ((mods & ~REMOTE_MONITOR_INPUT_MOD_MASK) != 0) {
+				RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_VALUE,
+					"INPUT_KEY modifiers are invalid.");
+				break;
+			}
+			if (consol != 0) {
+				RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_VALUE,
+					"INPUT_KEY console mask must be 0.");
+				break;
+			}
+			if (action != REMOTE_MONITOR_INPUT_KEY_ACTION_UP &&
+			    action != REMOTE_MONITOR_INPUT_KEY_ACTION_DOWN) {
+				RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_VALUE,
+					"INPUT_KEY action is invalid.");
+				break;
+			}
+
+			keycode = (int)(payload[4] | (payload[5] << 8));
+			if (action == REMOTE_MONITOR_INPUT_KEY_ACTION_DOWN) {
+				if (keycode == 0 || keycode > 255) {
+					RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_VALUE,
+						"INPUT_KEY keycode must be 1..255 for HID key down.");
+					break;
+				}
+			}
+			else {
+				if (keycode > 255) {
+					RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_VALUE,
+						"INPUT_KEY keycode must be 0..255 for HID key up.");
+					break;
+				}
+			}
+			INPUT_RemoteKeyEvent(keyspace, action, keycode, (int)mods);
+			RemoteMonitor_Reply(client->fd, REMOTE_MONITOR_OK, NULL, 0);
+		}
+		break;
+	case REMOTE_MONITOR_CMD_INPUT_JOYSTICKS:
+		if (len != 2) {
+			RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_LENGTH,
+				"INPUT_JOYSTICKS expects a 2-byte payload.");
+			break;
+		}
+		{
+			unsigned char joy1 = payload[0];
+			unsigned char joy2 = payload[1];
+
+			if ((joy1 & ~REMOTE_MONITOR_INPUT_JOY_MASK) != 0 ||
+			    (joy2 & ~REMOTE_MONITOR_INPUT_JOY_MASK) != 0) {
+				RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_VALUE,
+					"INPUT_JOYSTICKS mask is invalid.");
+				break;
+			}
+			INPUT_RemoteSetJoysticks(joy1, joy2);
+			RemoteMonitor_Reply(client->fd, REMOTE_MONITOR_OK, NULL, 0);
+		}
+		break;
+	case REMOTE_MONITOR_CMD_INPUT_SPECIAL:
+		if (len != 1) {
+			RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_LENGTH,
+				"INPUT_SPECIAL expects a 1-byte payload.");
+			break;
+		}
+		{
+			unsigned char special = payload[0];
+
+			if ((special & ~REMOTE_MONITOR_INPUT_SPECIAL_MASK) != 0) {
+				RemoteMonitor_ReplyError(client, REMOTE_MONITOR_ERR_INVALID_VALUE,
+					"INPUT_SPECIAL mask is invalid.");
+				break;
+			}
+			INPUT_RemoteSetSpecial(special);
+			RemoteMonitor_Reply(client->fd, REMOTE_MONITOR_OK, NULL, 0);
 		}
 		break;
 	default:

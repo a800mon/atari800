@@ -1177,6 +1177,105 @@ Validation:
 
 ---
 
+### `43` `INPUT_KEY`
+
+Request payload:
+
+| Field | Size | Description |
+| --- | --- | --- |
+| `action` | `u8` | `0` key up, `1` key down. |
+| `keyspace` | `u8` | Keyspace (`1` = HID scancode). |
+| `mods` | `u8` | Modifier bits (see below). |
+| `consol` | `u8` | Reserved, must be `0`. |
+| `keycode` | `u16` | Key code (see keyspace rules below). |
+
+`mods` bits:
+
+| Bit | Meaning |
+| --- | --- |
+| `0` | Shift pressed. |
+| `1` | Control pressed. |
+| `2` | Alt pressed (ignored by emulator). |
+
+Response `OK` data:
+
+| Field | Size | Description |
+| --- | --- | --- |
+| (none) | `0` | Empty. |
+
+Keyspace rules:
+
+- `HID` (`keyspace=1`): `keycode` is USB HID keyboard usage (page `0x07`, `1..255`). `0` is allowed only for `action=0` (no-op). SDL builds feed this into the SDL keyboard path as a scancode.
+
+Behavior:
+- SDL builds inject HID scancodes into the SDL keyboard path.
+- Only one remote key is tracked; the most recent key-down wins.
+- Key-up is ignored unless the scancode matches the most recent key-down.
+
+---
+
+### `44` `INPUT_JOYSTICKS`
+
+Request payload:
+
+| Field | Size | Description |
+| --- | --- | --- |
+| `joy1` | `u8` | Joystick 1 state bits (see below). |
+| `joy2` | `u8` | Joystick 2 state bits (see below). |
+
+`joy` bits:
+
+| Bit | Meaning |
+| --- | --- |
+| `0` | Up pressed. |
+| `1` | Down pressed. |
+| `2` | Left pressed. |
+| `3` | Right pressed. |
+| `4` | Fire pressed. |
+
+Response `OK` data:
+
+| Field | Size | Description |
+| --- | --- | --- |
+| (none) | `0` | Empty. |
+
+Behavior:
+- Joystick state is level-based; values stay in effect until changed.
+- Remote joystick input is merged with local input (pressed if either source is pressed).
+
+---
+
+### `45` `INPUT_SPECIAL`
+
+Request payload:
+
+| Field | Size | Description |
+| --- | --- | --- |
+| `state` | `u8` | Special key state bits (pressed = 1). |
+
+`state` bits:
+
+| Bit | Meaning |
+| --- | --- |
+| `0` | Help pressed. |
+| `1` | Start pressed. |
+| `2` | Select pressed. |
+| `3` | Option pressed. |
+| `4` | Reset pressed. |
+| `5` | Break pressed. |
+
+Response `OK` data:
+
+| Field | Size | Description |
+| --- | --- | --- |
+| (none) | `0` | Empty. |
+
+Behavior:
+- Start/Select/Option are level-based and merged with local console keys.
+- Help/Reset/Break trigger on a press edge and are ignored while held.
+
+---
+
 ## `state_seq` Semantics
 
 `state_seq` is a monotonic `u32` included in `STATUS`.
