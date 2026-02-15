@@ -5,6 +5,7 @@ This document describes the Remote Monitor binary RPC protocol implemented in `s
 ## Transport
 
 - Transport: UNIX domain stream socket (`AF_UNIX`, `SOCK_STREAM`)
+- Video stream (optional): UDP datagrams to configured host/port (see "Video Stream (UDP)").
 - Enable in emulator:
   - `-remote-monitor`
   - `-remote-monitor-transport socket`
@@ -41,6 +42,55 @@ All multi-byte integers are little-endian.
 - If declared frame size exceeds internal input buffer, server closes client connection
 - Queued `STATUS` requests are coalesced: only newest pending `STATUS` is handled
 - Server send path is non-blocking; send failure closes client connection
+
+## Video Stream (UDP)
+
+Remote Monitor can optionally stream the rendered screen over UDP. This stream
+is best-effort and does not retransmit dropped packets.
+
+Enable in emulator:
+
+- `-remote-monitor`
+- `-remote-monitor-video`
+- `-remote-monitor-video-udp-host <host>` (default `127.0.0.1`)
+- `-remote-monitor-video-udp-port <port>` (default `6502`)
+- `-remote-monitor-video-fps <fps>` (default `60`)
+- config: `REMOTE_MONITOR_VIDEO=1`, `REMOTE_MONITOR_VIDEO_UDP_HOST=<host>`,
+  `REMOTE_MONITOR_VIDEO_UDP_PORT=<port>`, `REMOTE_MONITOR_VIDEO_FPS=<fps>`
+
+The stream sends the visible Atari screen area as RGB888 (`R`, `G`, `B` bytes),
+split into row chunks that fit within UDP datagrams. Default visible size is
+336x240, but it can change with view-area settings.
+Frames are sent only when the emulator refreshes the screen and are throttled
+to the configured FPS; if emulation is paused or frames are skipped, the stream
+may stall.
+All multi-byte fields in the UDP header are little-endian.
+
+### UDP Packet Header (24 bytes)
+
+| Field | Size | Description |
+| --- | --- | --- |
+| `magic` | `4` | ASCII `RMV1`. |
+| `version` | `u8` | Protocol version (`1`). |
+| `format` | `u8` | Pixel format (`1` = `RGB888`). |
+| `flags` | `u8` | Packet flags (see below). |
+| `reserved` | `u8` | Reserved, must be `0`. |
+| `frame_seq` | `u32` | Frame sequence (`Atari800_nframes`). |
+| `width` | `u16` | Visible frame width in pixels. |
+| `height` | `u16` | Visible frame height in pixels. |
+| `x` | `u16` | Start column (currently `0`). |
+| `y` | `u16` | Start row of payload (within visible frame). |
+| `rows` | `u16` | Number of rows in payload. |
+| `row_bytes` | `u16` | Bytes per row (`width * 3`). |
+
+Payload: `rows * row_bytes` bytes, row-major RGB888.
+
+`flags` bits:
+
+| Bit | Meaning |
+| --- | --- |
+| `0` | First packet of frame. |
+| `1` | Last packet of frame. |
 
 ## Status Codes
 

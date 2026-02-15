@@ -239,6 +239,14 @@ int CFG_LoadConfig(const char *alternate_config_filename)
 			else if (strcmp(string, "REMOTE_MONITOR_AUDIO_ON_DEBUG") == 0) {
 				Atari800_audio_on_debug = Util_sscanbool(ptr);
 			}
+			else if (strcmp(string, "REMOTE_MONITOR_VIDEO") == 0) {
+#if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
+				RemoteMonitor_SetVideoEnabled(Util_sscanbool(ptr));
+#else
+				if (Util_sscanbool(ptr))
+					Log_print("Remote Monitor video is not supported on this platform.");
+#endif
+			}
 #if defined(HAVE_UNISTD_H) && !defined(HAVE_WINDOWS_H)
 			else if (strcmp(string, "REMOTE_MONITOR_TRANSPORT") == 0) {
 				if (!RemoteMonitor_SetTransport(ptr)) {
@@ -268,6 +276,30 @@ int CFG_LoadConfig(const char *alternate_config_filename)
 					RemoteMonitor_SetTransport("socket");
 				if (RemoteMonitor_Enabled())
 					Atari800_SetBuiltinMonitor(FALSE);
+			}
+			else if (strcmp(string, "REMOTE_MONITOR_VIDEO_UDP_HOST") == 0) {
+				if (ptr[0] == '\0')
+					RemoteMonitor_SetVideoUdpHost(NULL);
+				else
+					RemoteMonitor_SetVideoUdpHost(ptr);
+			}
+			else if (strcmp(string, "REMOTE_MONITOR_VIDEO_UDP_PORT") == 0) {
+				int port = Util_sscandec(ptr);
+				if (port < 1 || port > 65535) {
+					Log_print("Invalid Remote Monitor video UDP port: %s", ptr);
+				}
+				else {
+					RemoteMonitor_SetVideoUdpPort(port);
+				}
+			}
+			else if (strcmp(string, "REMOTE_MONITOR_VIDEO_FPS") == 0) {
+				int fps = Util_sscandec(ptr);
+				if (fps < 1 || fps > 240) {
+					Log_print("Invalid Remote Monitor video fps: %s", ptr);
+				}
+				else {
+					RemoteMonitor_SetVideoFps(fps);
+				}
 			}
 #endif
 
@@ -498,8 +530,13 @@ int CFG_WriteConfig(void)
 	{
 		const char *transport = RemoteMonitor_GetTransport();
 		const char *socket_path = RemoteMonitor_GetSocketPath();
+		const char *video_host = RemoteMonitor_GetVideoUdpHost();
 		fprintf(fp, "REMOTE_MONITOR_TRANSPORT=%s\n", transport != NULL ? transport : "");
 		fprintf(fp, "REMOTE_MONITOR_SOCKET_PATH=%s\n", socket_path != NULL ? socket_path : "");
+		fprintf(fp, "REMOTE_MONITOR_VIDEO=%d\n", RemoteMonitor_VideoEnabled() ? 1 : 0);
+		fprintf(fp, "REMOTE_MONITOR_VIDEO_UDP_HOST=%s\n", video_host != NULL ? video_host : "");
+		fprintf(fp, "REMOTE_MONITOR_VIDEO_UDP_PORT=%d\n", RemoteMonitor_GetVideoUdpPort());
+		fprintf(fp, "REMOTE_MONITOR_VIDEO_FPS=%d\n", RemoteMonitor_GetVideoFps());
 	}
 #endif
 

@@ -164,6 +164,16 @@ Command line options
 -remote-monitor-socket-path <path>
                      Set UNIX socket path for Remote Monitor socket transport
                      (on Linux, default socket path is /tmp/atari.sock)
+-remote-monitor-video
+                     Enable Remote Monitor video stream
+-no-remote-monitor-video
+                     Disable Remote Monitor video stream
+-remote-monitor-video-udp-host <host>
+                     Set UDP host for Remote Monitor video stream (default 127.0.0.1)
+-remote-monitor-video-udp-port <port>
+                     Set UDP port for Remote Monitor video stream (default 6502)
+-remote-monitor-video-fps <fps>
+                     Set Remote Monitor video stream FPS (1-240, default 60)
 -remote-monitor-audio-on-debug
                      Keep audio enabled while debugging (default)
 -no-remote-monitor-audio-on-debug

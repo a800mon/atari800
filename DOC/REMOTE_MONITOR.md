@@ -33,6 +33,16 @@ while allowing remote-enabled behavior during an active remote session.
   - Keep audio enabled while debugging (default).
 - `-no-remote-monitor-audio-on-debug`
   - Disable audio while debugging.
+- `-remote-monitor-video`
+  - Enable Remote Monitor video stream (UDP).
+- `-no-remote-monitor-video`
+  - Disable Remote Monitor video stream.
+- `-remote-monitor-video-udp-host <host>`
+  - Set UDP host for Remote Monitor video stream.
+- `-remote-monitor-video-udp-port <port>`
+  - Set UDP port for Remote Monitor video stream (default: `6502`).
+- `-remote-monitor-video-fps <fps>`
+  - Set Remote Monitor video stream FPS (1-240, default: `60`).
 
 ## Configuration
 
@@ -43,6 +53,10 @@ Remote Monitor can be enabled and configured without command-line flags:
 - `REMOTE_MONITOR_TRANSPORT` (configuration only; does not enable on its own).
 - `REMOTE_MONITOR_SOCKET_PATH` (configuration only; does not enable on its own).
 - `REMOTE_MONITOR_AUDIO_ON_DEBUG`
+- `REMOTE_MONITOR_VIDEO` (requires `REMOTE_MONITOR=1` to stream).
+- `REMOTE_MONITOR_VIDEO_UDP_HOST`
+- `REMOTE_MONITOR_VIDEO_UDP_PORT`
+- `REMOTE_MONITOR_VIDEO_FPS`
 
 These values are read on startup and written by configuration save, so GUI
 "Save configuration" persists them.
@@ -63,6 +77,14 @@ These values are read on startup and written by configuration save, so GUI
 - `REMOTE_MONITOR_AUDIO_ON_DEBUG=1`: audio may stay active during remote debug refresh commands.
 - `REMOTE_MONITOR_AUDIO_ON_DEBUG=0`: audio stays paused in debug flow to avoid unwanted output
   during step/frame refresh.
+
+## Video Stream (UDP)
+
+- UDP video streaming is optional and best-effort (packet loss is tolerated).
+- Stream format is documented in `REMOTE_MONITOR_PROTOCOL.md`.
+- The stream uses RGB888 and includes the visible screen area (default 336x240).
+- Remote Monitor must be enabled for the video stream to run.
+- Default UDP host is `127.0.0.1`.
 
 ## Socket Transport Notes
 

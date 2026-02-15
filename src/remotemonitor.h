@@ -157,11 +157,23 @@
 #define REMOTE_MONITOR_SET_REG_Z 10
 #define REMOTE_MONITOR_SET_REG_C 11
 
+#define REMOTE_MONITOR_VIDEO_FORMAT_RGB888 1
+#define REMOTE_MONITOR_VIDEO_FLAG_FIRST 0x01
+#define REMOTE_MONITOR_VIDEO_FLAG_LAST 0x02
+
 int RemoteMonitor_SetTransport(const char *transport);
 const char *RemoteMonitor_GetTransport(void);
 void RemoteMonitor_SetSocketPath(const char *path);
 const char *RemoteMonitor_GetSocketPath(void);
 const char *RemoteMonitor_DefaultSocketPath(void);
+void RemoteMonitor_SetVideoEnabled(int enabled);
+int RemoteMonitor_VideoEnabled(void);
+void RemoteMonitor_SetVideoUdpHost(const char *host);
+const char *RemoteMonitor_GetVideoUdpHost(void);
+void RemoteMonitor_SetVideoUdpPort(int port);
+int RemoteMonitor_GetVideoUdpPort(void);
+void RemoteMonitor_SetVideoFps(int fps);
+int RemoteMonitor_GetVideoFps(void);
 void RemoteMonitor_SetEnabled(int enabled);
 void RemoteMonitor_EnableDefault(void);
 void RemoteMonitor_Disable(void);
@@ -170,5 +182,6 @@ int RemoteMonitor_HasClients(void);
 void RemoteMonitor_Poll(void);
 void RemoteMonitor_CloseAll(void);
 void RemoteMonitor_NotifyStateChanged(void);
+void RemoteMonitor_VideoFrame(int display_screen);
 
 #endif /* REMOTEMONITOR_H_ */

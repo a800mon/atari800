@@ -751,6 +751,12 @@ int Atari800_Initialise(int *argc, char *argv[])
 			else if (strcmp(argv[i], "-no-remote-monitor") == 0) {
 				RemoteMonitor_Disable();
 			}
+			else if (strcmp(argv[i], "-remote-monitor-video") == 0) {
+				RemoteMonitor_SetVideoEnabled(TRUE);
+			}
+			else if (strcmp(argv[i], "-no-remote-monitor-video") == 0) {
+				RemoteMonitor_SetVideoEnabled(FALSE);
+			}
 				else if (strcmp(argv[i], "-remote-monitor-transport") == 0) {
 					if (i_a) {
 						const char *transport = argv[++i];
@@ -793,12 +799,48 @@ int Atari800_Initialise(int *argc, char *argv[])
 				else
 					a_m = TRUE;
 			}
+			else if (strcmp(argv[i], "-remote-monitor-video-udp-host") == 0) {
+				if (i_a)
+					RemoteMonitor_SetVideoUdpHost(argv[++i]);
+				else
+					a_m = TRUE;
+			}
+			else if (strcmp(argv[i], "-remote-monitor-video-udp-port") == 0) {
+				if (i_a) {
+					int port = Util_sscandec(argv[++i]);
+					if (port < 1 || port > 65535) {
+						Log_print("Invalid Remote Monitor video UDP port \"%s\".", argv[i]);
+						return FALSE;
+					}
+					RemoteMonitor_SetVideoUdpPort(port);
+				}
+				else
+					a_m = TRUE;
+			}
+			else if (strcmp(argv[i], "-remote-monitor-video-fps") == 0) {
+				if (i_a) {
+					int fps = Util_sscandec(argv[++i]);
+					if (fps < 1 || fps > 240) {
+						Log_print("Invalid Remote Monitor video fps \"%s\".", argv[i]);
+						return FALSE;
+					}
+					RemoteMonitor_SetVideoFps(fps);
+				}
+				else
+					a_m = TRUE;
+			}
 #else
 			else if (strcmp(argv[i], "-remote-monitor") == 0) {
 				Log_print("Remote Monitor is not supported on this platform.");
 			}
 			else if (strcmp(argv[i], "-no-remote-monitor") == 0) {
 				Log_print("Remote Monitor is not supported on this platform.");
+			}
+			else if (strcmp(argv[i], "-remote-monitor-video") == 0) {
+				Log_print("Remote Monitor video is not supported on this platform.");
+			}
+			else if (strcmp(argv[i], "-no-remote-monitor-video") == 0) {
+				Log_print("Remote Monitor video is not supported on this platform.");
 			}
 			else if (strcmp(argv[i], "-remote-monitor-transport") == 0) {
 				if (i_a)
@@ -809,6 +851,21 @@ int Atari800_Initialise(int *argc, char *argv[])
 				if (i_a)
 					++i;
 				Log_print("Remote Monitor is not supported on this platform.");
+			}
+			else if (strcmp(argv[i], "-remote-monitor-video-udp-host") == 0) {
+				if (i_a)
+					++i;
+				Log_print("Remote Monitor video is not supported on this platform.");
+			}
+			else if (strcmp(argv[i], "-remote-monitor-video-udp-port") == 0) {
+				if (i_a)
+					++i;
+				Log_print("Remote Monitor video is not supported on this platform.");
+			}
+			else if (strcmp(argv[i], "-remote-monitor-video-fps") == 0) {
+				if (i_a)
+					++i;
+				Log_print("Remote Monitor video is not supported on this platform.");
 			}
 #endif
 #ifdef R_IO_DEVICE
@@ -930,6 +987,15 @@ int Atari800_Initialise(int *argc, char *argv[])
 					Log_print("\t                 Set UNIX socket path for Remote Monitor socket transport");
 					if (RemoteMonitor_DefaultSocketPath() != NULL)
 						Log_print("\t                 Default socket path: \"%s\"", RemoteMonitor_DefaultSocketPath());
+					Log_print("\t-remote-monitor-video  Enable Remote Monitor video stream");
+					Log_print("\t-no-remote-monitor-video");
+					Log_print("\t                 Disable Remote Monitor video stream");
+					Log_print("\t-remote-monitor-video-udp-host <host>");
+					Log_print("\t                 Set UDP host for Remote Monitor video stream (default 127.0.0.1)");
+					Log_print("\t-remote-monitor-video-udp-port <port>");
+					Log_print("\t                 Set UDP port for Remote Monitor video stream (default 6502)");
+					Log_print("\t-remote-monitor-video-fps <fps>");
+					Log_print("\t                 Set Remote Monitor video stream FPS (1-240, default 60)");
 #endif
 #ifndef BASIC
 					Log_print("\t-state <file>    Load saved-state file");
@@ -1733,6 +1799,8 @@ void Atari800_Frame(void)
 			Atari800_Sync();
 #endif /* BENCHMARK */
 #endif /* LIBATARI800 */
+
+	RemoteMonitor_VideoFrame(Atari800_display_screen);
 }
 
 #endif /* __PLUS */

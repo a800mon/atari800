@@ -9,6 +9,7 @@
 #include "binload.h"
 #include "cartridge.h"
 #include "cassette.h"
+#include "colours.h"
 #include "cpu.h"
 #include "gtia.h"
 #include "log.h"
@@ -16,6 +17,7 @@
 #include "monitor.h"
 #include "pia.h"
 #include "pokey.h"
+#include "screen.h"
 #include "sio.h"
 #include "ui.h"
 #include "util.h"
@@ -26,12 +28,16 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netdb.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -39,6 +45,10 @@
 
 #define REMOTE_MONITOR_MAX_CLIENTS 8
 #define REMOTE_MONITOR_MAX_PAYLOAD 4096
+#define REMOTE_MONITOR_VIDEO_DEFAULT_FPS 60
+#define REMOTE_MONITOR_VIDEO_DEFAULT_PORT 6502
+#define REMOTE_MONITOR_VIDEO_MAX_DATAGRAM 1400
+#define REMOTE_MONITOR_VIDEO_HEADER_SIZE 24
 
 #if defined(__linux__)
 #define REMOTE_MONITOR_DEFAULT_PATH "/tmp/atari.sock"
@@ -58,6 +68,16 @@ static char remote_monitor_owned_socket_path[FILENAME_MAX];
 static int remote_monitor_clients_ready = FALSE;
 static int remote_monitor_init_failed = FALSE;
 static uint32_t remote_monitor_state_seq = 0;
+static int remote_monitor_video_enabled = FALSE;
+static int remote_monitor_video_fps = REMOTE_MONITOR_VIDEO_DEFAULT_FPS;
+static int remote_monitor_video_udp_port = REMOTE_MONITOR_VIDEO_DEFAULT_PORT;
+static char remote_monitor_video_udp_host[FILENAME_MAX] = "127.0.0.1";
+static int remote_monitor_video_fd = -1;
+static int remote_monitor_video_init_failed = FALSE;
+static double remote_monitor_video_last_time = 0.0;
+static int remote_monitor_video_logged = FALSE;
+static struct sockaddr_storage remote_monitor_video_addr;
+static socklen_t remote_monitor_video_addr_len = 0;
 
 struct RemoteMonitorClient {
 	int fd;
@@ -66,6 +86,10 @@ struct RemoteMonitorClient {
 };
 
 static struct RemoteMonitorClient remote_monitor_clients[REMOTE_MONITOR_MAX_CLIENTS];
+
+static void RemoteMonitor_VideoClose(void);
+static int RemoteMonitor_VideoInit(void);
+static void RemoteMonitor_VideoEncodeRow(unsigned char *dst, const UBYTE *src, int width);
 
 
 static unsigned char RemoteMonitor_StatusMachineType(void)
@@ -270,10 +294,63 @@ const char *RemoteMonitor_DefaultSocketPath(void)
 #endif
 }
 
+void RemoteMonitor_SetVideoEnabled(int enabled)
+{
+	remote_monitor_video_enabled = enabled ? TRUE : FALSE;
+	remote_monitor_video_init_failed = FALSE;
+	remote_monitor_video_last_time = 0.0;
+	remote_monitor_video_logged = FALSE;
+	if (!remote_monitor_video_enabled)
+		RemoteMonitor_VideoClose();
+}
+
+int RemoteMonitor_VideoEnabled(void)
+{
+	return remote_monitor_video_enabled;
+}
+
+void RemoteMonitor_SetVideoUdpHost(const char *host)
+{
+	if (host == NULL || host[0] == '\0')
+		remote_monitor_video_udp_host[0] = '\0';
+	else
+		Util_strlcpy(remote_monitor_video_udp_host, host, sizeof(remote_monitor_video_udp_host));
+	remote_monitor_video_init_failed = FALSE;
+	RemoteMonitor_VideoClose();
+}
+
+const char *RemoteMonitor_GetVideoUdpHost(void)
+{
+	return remote_monitor_video_udp_host[0] != '\0' ? remote_monitor_video_udp_host : NULL;
+}
+
+void RemoteMonitor_SetVideoUdpPort(int port)
+{
+	remote_monitor_video_udp_port = port;
+	remote_monitor_video_init_failed = FALSE;
+	RemoteMonitor_VideoClose();
+}
+
+int RemoteMonitor_GetVideoUdpPort(void)
+{
+	return remote_monitor_video_udp_port;
+}
+
+void RemoteMonitor_SetVideoFps(int fps)
+{
+	remote_monitor_video_fps = fps;
+}
+
+int RemoteMonitor_GetVideoFps(void)
+{
+	return remote_monitor_video_fps;
+}
+
 void RemoteMonitor_SetEnabled(int enabled)
 {
 	remote_monitor_enabled = enabled ? TRUE : FALSE;
 	remote_monitor_init_failed = FALSE;
+	remote_monitor_video_init_failed = FALSE;
 }
 
 void RemoteMonitor_EnableDefault(void)
@@ -289,12 +366,14 @@ void RemoteMonitor_EnableDefault(void)
 		Util_strlcpy(remote_monitor_socket_path, default_socket_path, sizeof(remote_monitor_socket_path));
 	}
 	remote_monitor_init_failed = FALSE;
+	remote_monitor_video_init_failed = FALSE;
 }
 
 void RemoteMonitor_Disable(void)
 {
 	RemoteMonitor_SetEnabled(FALSE);
 	RemoteMonitor_CloseAll();
+	RemoteMonitor_VideoClose();
 }
 
 int RemoteMonitor_Enabled(void)
@@ -320,6 +399,138 @@ int RemoteMonitor_HasClients(void)
 void RemoteMonitor_NotifyStateChanged(void)
 {
 	remote_monitor_state_seq++;
+}
+
+void RemoteMonitor_VideoFrame(int display_screen)
+{
+	unsigned char packet[REMOTE_MONITOR_VIDEO_MAX_DATAGRAM];
+	unsigned char *dst;
+	const UBYTE *screen;
+	uint32_t frame_seq;
+	double now;
+	double interval;
+	size_t row_bytes;
+	size_t max_payload;
+	int rows_per_packet;
+	int width;
+	int height;
+	int left;
+	int top;
+	int y;
+
+	if (!display_screen)
+		return;
+	if (!remote_monitor_enabled || !remote_monitor_video_enabled)
+		return;
+	if (remote_monitor_video_fps <= 0)
+		return;
+	if (Screen_atari == NULL)
+		return;
+	if (!RemoteMonitor_VideoInit())
+		return;
+
+	now = Util_time();
+	interval = 1.0 / (double)remote_monitor_video_fps;
+	if (remote_monitor_video_last_time > 0.0 &&
+	    (now - remote_monitor_video_last_time) < interval)
+		return;
+	remote_monitor_video_last_time = now;
+
+	left = Screen_visible_x1;
+	top = Screen_visible_y1;
+	width = Screen_visible_x2 - Screen_visible_x1;
+	height = Screen_visible_y2 - Screen_visible_y1;
+	if (width <= 0 || height <= 0) {
+		Log_print("Remote Monitor video: Visible screen area is invalid.");
+		remote_monitor_video_init_failed = TRUE;
+		RemoteMonitor_VideoClose();
+		return;
+	}
+	if (left < 0 || top < 0 ||
+	    left + width > Screen_WIDTH ||
+	    top + height > Screen_HEIGHT) {
+		Log_print("Remote Monitor video: Visible screen area is out of bounds.");
+		remote_monitor_video_init_failed = TRUE;
+		RemoteMonitor_VideoClose();
+		return;
+	}
+	row_bytes = (size_t)width * 3;
+	if (row_bytes > UINT16_MAX) {
+		Log_print("Remote Monitor video: Row size exceeds supported payload size.");
+		remote_monitor_video_init_failed = TRUE;
+		RemoteMonitor_VideoClose();
+		return;
+	}
+	max_payload = REMOTE_MONITOR_VIDEO_MAX_DATAGRAM - REMOTE_MONITOR_VIDEO_HEADER_SIZE;
+	if (row_bytes > max_payload) {
+		Log_print("Remote Monitor video: Row size exceeds UDP payload limit.");
+		remote_monitor_video_init_failed = TRUE;
+		RemoteMonitor_VideoClose();
+		return;
+	}
+	rows_per_packet = (int)(max_payload / row_bytes);
+	if (rows_per_packet < 1)
+		rows_per_packet = 1;
+
+	screen = (const UBYTE *)Screen_atari;
+	frame_seq = (uint32_t)Atari800_nframes;
+
+	for (y = 0; y < height; y += rows_per_packet) {
+		int rows = height - y;
+		size_t data_len;
+		unsigned char flags = 0;
+		int row;
+
+		if (rows > rows_per_packet)
+			rows = rows_per_packet;
+		if (y == 0)
+			flags |= REMOTE_MONITOR_VIDEO_FLAG_FIRST;
+		if (y + rows >= height)
+			flags |= REMOTE_MONITOR_VIDEO_FLAG_LAST;
+
+		memcpy(packet, "RMV1", 4);
+		packet[4] = 1;
+		packet[5] = REMOTE_MONITOR_VIDEO_FORMAT_RGB888;
+		packet[6] = flags;
+		packet[7] = 0;
+		packet[8] = (unsigned char)(frame_seq & 0xff);
+		packet[9] = (unsigned char)((frame_seq >> 8) & 0xff);
+		packet[10] = (unsigned char)((frame_seq >> 16) & 0xff);
+		packet[11] = (unsigned char)((frame_seq >> 24) & 0xff);
+		packet[12] = (unsigned char)(width & 0xff);
+		packet[13] = (unsigned char)((width >> 8) & 0xff);
+		packet[14] = (unsigned char)(height & 0xff);
+		packet[15] = (unsigned char)((height >> 8) & 0xff);
+		packet[16] = 0;
+		packet[17] = 0;
+		packet[18] = (unsigned char)(y & 0xff);
+		packet[19] = (unsigned char)((y >> 8) & 0xff);
+		packet[20] = (unsigned char)(rows & 0xff);
+		packet[21] = (unsigned char)((rows >> 8) & 0xff);
+		packet[22] = (unsigned char)(row_bytes & 0xff);
+		packet[23] = (unsigned char)((row_bytes >> 8) & 0xff);
+
+		dst = packet + REMOTE_MONITOR_VIDEO_HEADER_SIZE;
+		for (row = 0; row < rows; row++) {
+			const UBYTE *src = screen + (top + y + row) * Screen_WIDTH + left;
+			RemoteMonitor_VideoEncodeRow(dst, src, width);
+			dst += row_bytes;
+		}
+		data_len = (size_t)rows * row_bytes;
+
+		if (sendto(remote_monitor_video_fd, packet,
+		           REMOTE_MONITOR_VIDEO_HEADER_SIZE + data_len,
+		           MSG_DONTWAIT,
+		           (struct sockaddr *)&remote_monitor_video_addr,
+		           remote_monitor_video_addr_len) < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			Log_print("Remote Monitor video: UDP send failed.");
+			remote_monitor_video_init_failed = TRUE;
+			RemoteMonitor_VideoClose();
+			return;
+		}
+	}
 }
 
 static void RemoteMonitor_CloseClient(struct RemoteMonitorClient *client)
@@ -365,6 +576,93 @@ void RemoteMonitor_CloseAll(void)
 	}
 	RemoteMonitor_CloseListen();
 	remote_monitor_init_failed = FALSE;
+}
+
+static void RemoteMonitor_VideoClose(void)
+{
+	if (remote_monitor_video_fd >= 0) {
+		close(remote_monitor_video_fd);
+		remote_monitor_video_fd = -1;
+	}
+	remote_monitor_video_addr_len = 0;
+	remote_monitor_video_last_time = 0.0;
+	remote_monitor_video_logged = FALSE;
+}
+
+static int RemoteMonitor_VideoInit(void)
+{
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
+	struct addrinfo *cur;
+	char port_buf[16];
+	int fd = -1;
+
+	if (remote_monitor_video_fd >= 0)
+		return TRUE;
+	if (remote_monitor_video_init_failed)
+		return FALSE;
+	if (remote_monitor_video_udp_host[0] == '\0') {
+		Log_print("Remote Monitor video: UDP host is not set.");
+		remote_monitor_video_init_failed = TRUE;
+		return FALSE;
+	}
+	if (remote_monitor_video_udp_port < 1 || remote_monitor_video_udp_port > 65535) {
+		Log_print("Remote Monitor video: UDP port is invalid.");
+		remote_monitor_video_init_failed = TRUE;
+		return FALSE;
+	}
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_family = AF_UNSPEC;
+	snprintf(port_buf, sizeof(port_buf), "%d", remote_monitor_video_udp_port);
+	if (getaddrinfo(remote_monitor_video_udp_host, port_buf, &hints, &res) != 0) {
+		Log_print("Remote Monitor video: UDP host resolution failed.");
+		remote_monitor_video_init_failed = TRUE;
+		return FALSE;
+	}
+
+	for (cur = res; cur != NULL; cur = cur->ai_next) {
+		fd = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
+		if (fd >= 0) {
+			remote_monitor_video_addr_len = cur->ai_addrlen;
+			memcpy(&remote_monitor_video_addr, cur->ai_addr, cur->ai_addrlen);
+			break;
+		}
+	}
+	freeaddrinfo(res);
+	if (fd < 0) {
+		Log_print("Remote Monitor video: Cannot create UDP socket.");
+		remote_monitor_video_init_failed = TRUE;
+		return FALSE;
+	}
+
+	{
+		int flags = fcntl(fd, F_GETFL, 0);
+		if (flags >= 0)
+			(void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	}
+	remote_monitor_video_fd = fd;
+	if (!remote_monitor_video_logged) {
+		Log_print("Remote Monitor video: Streaming UDP to %s:%d at %d FPS.",
+			remote_monitor_video_udp_host, remote_monitor_video_udp_port,
+			remote_monitor_video_fps);
+		remote_monitor_video_logged = TRUE;
+	}
+	return TRUE;
+}
+
+static void RemoteMonitor_VideoEncodeRow(unsigned char *dst, const UBYTE *src, int width)
+{
+	int x;
+
+	for (x = 0; x < width; x++) {
+		int rgb = Colours_table[src[x]];
+		dst[0] = (unsigned char)(rgb >> 16);
+		dst[1] = (unsigned char)(rgb >> 8);
+		dst[2] = (unsigned char)rgb;
+		dst += 3;
+	}
 }
 
 static void RemoteMonitor_Init(void)
@@ -2130,6 +2428,46 @@ const char *RemoteMonitor_DefaultSocketPath(void)
 	return NULL;
 }
 
+void RemoteMonitor_SetVideoEnabled(int enabled)
+{
+	(void)enabled;
+}
+
+int RemoteMonitor_VideoEnabled(void)
+{
+	return 0;
+}
+
+void RemoteMonitor_SetVideoUdpHost(const char *host)
+{
+	(void)host;
+}
+
+const char *RemoteMonitor_GetVideoUdpHost(void)
+{
+	return NULL;
+}
+
+void RemoteMonitor_SetVideoUdpPort(int port)
+{
+	(void)port;
+}
+
+int RemoteMonitor_GetVideoUdpPort(void)
+{
+	return 0;
+}
+
+void RemoteMonitor_SetVideoFps(int fps)
+{
+	(void)fps;
+}
+
+int RemoteMonitor_GetVideoFps(void)
+{
+	return 0;
+}
+
 void RemoteMonitor_SetEnabled(int enabled)
 {
 	(void)enabled;
@@ -2163,6 +2501,11 @@ void RemoteMonitor_CloseAll(void)
 
 void RemoteMonitor_NotifyStateChanged(void)
 {
+}
+
+void RemoteMonitor_VideoFrame(int display_screen)
+{
+	(void)display_screen;
 }
 
 #endif
